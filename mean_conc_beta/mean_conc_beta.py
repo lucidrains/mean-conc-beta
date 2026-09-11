@@ -2,7 +2,7 @@ from __future__ import annotations
 import math
 
 import torch
-from torch import Tensor, Size
+from torch import Tensor, Size, is_tensor
 import torch.nn.functional as F
 from torch.nn import Module
 from torch.distributions import (
@@ -19,6 +19,40 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+# transformed beta distribution on (-1, 1)
+
+class TransformedBeta(TransformedDistribution):
+    def __init__(
+        self,
+        base_dist: Distribution,
+        transform: AffineTransform
+    ):
+        assert isinstance(transform, AffineTransform), 'TransformedBeta only supports affine transforms'
+        assert transform.event_dim == 0, 'TransformedBeta only supports non-event affine transforms'
+
+        super().__init__(base_dist, transform)
+
+    @property
+    def transform(self) -> AffineTransform:
+        return self.transforms[0]
+
+    @property
+    def mean(self) -> Tensor:
+        return self.transform(self.base_dist.mean)
+
+    @property
+    def mode(self) -> Tensor:
+        return self.transform(self.base_dist.mode)
+
+    @property
+    def variance(self) -> Tensor:
+        return self.base_dist.variance * self.transform.scale ** 2
+
+    def entropy(self) -> Tensor:
+        scale = self.transform.scale
+        log_scale = scale.abs().log() if is_tensor(scale) else math.log(abs(scale))
+        return self.base_dist.entropy() + log_scale
 
 # beta distribution policy - unimodal mean-concentration reparameterization on (-1, 1),
 # an affine shift of a unit-interval beta (y = 2x - 1)
@@ -57,8 +91,8 @@ class Beta(Module):
     def has_rsample(self) -> bool:
         return True
 
-    def to_dist(self, params_or_dist: Tensor | Distribution) -> Distribution:
-        return params_or_dist if isinstance(params_or_dist, Distribution) else self(params_or_dist)
+    def to_dist(self, params_or_dist: Tensor | Distribution, temperature: float = 1.) -> Distribution:
+        return params_or_dist if isinstance(params_or_dist, Distribution) else self(params_or_dist, temperature = temperature)
 
     def concentration(
         self,
@@ -82,20 +116,22 @@ class Beta(Module):
 
     def mode(
         self,
-        params_or_dist: Tensor | Distribution
+        params_or_dist: Tensor | Distribution,
+        temperature: float = 1.
     ) -> Tensor:
-        dist = self.to_dist(params_or_dist)
+        dist = self.to_dist(params_or_dist, temperature)
         base_dist = getattr(dist, 'base_dist', dist)
         return base_dist.mode * 2. - 1.
 
     def entropy(
         self,
         params_or_dist: Tensor | Distribution,
-        sum_action_dim = True
+        sum_action_dim = True,
+        temperature: float = 1.
     ) -> Tensor:
         # shifted beta entropy = base entropy + log(2), the affine jacobian
 
-        dist = self.to_dist(params_or_dist)
+        dist = self.to_dist(params_or_dist, temperature)
         base_dist = getattr(dist, 'base_dist', dist)
         entropy = base_dist.entropy() + math.log(2.)
         return entropy.sum(dim = -1) if sum_action_dim else entropy
@@ -105,34 +141,40 @@ class Beta(Module):
         params_or_dist: Tensor | Distribution,
         action: Tensor,
         sum_action_dim = True,
-        eps = None
+        eps = None,
+        temperature: float = 1.
     ) -> Tensor:
         eps = default(eps, self.eps)
         action = action.clamp(min = -1. + eps, max = 1. - eps)
-        dist = self.to_dist(params_or_dist)
+        dist = self.to_dist(params_or_dist, temperature)
         log_prob = dist.log_prob(action)
         return log_prob.sum(dim = -1) if sum_action_dim else log_prob
 
     def sample(
         self,
         params: Tensor,
-        sample_shape = ()
+        sample_shape = (),
+        temperature: float = 1.
     ) -> Tensor:
         sample_shape = Size(sample_shape)
-        return self(params).sample(sample_shape)
+        return self(params, temperature = temperature).sample(sample_shape)
 
     def rsample(
         self,
         params: Tensor,
-        sample_shape = ()
+        sample_shape = (),
+        temperature: float = 1.
     ) -> Tensor:
         sample_shape = Size(sample_shape)
-        return self(params).rsample(sample_shape)
+        return self(params, temperature = temperature).rsample(sample_shape)
 
     def forward(
         self,
-        params: Tensor
-    ) -> TransformedDistribution:
+        params: Tensor,
+        temperature: float = 1.
+    ) -> TransformedBeta:
+        assert temperature > 0., f'temperature must be positive, got {temperature}'
+
         raw_mean, raw_conc = params.unbind(dim = -1)
 
         # map (-1, 1) mean onto unit interval
@@ -140,7 +182,9 @@ class Beta(Module):
         mean = self.mean(params)
         unit_mean = (mean + 1.) / 2.
 
-        conc = self.concentration(raw_conc)
+        # temperature scales the concentration - lower temperature, sharper policy
+
+        conc = self.concentration(raw_conc) / temperature
 
         # keep the beta unimodal without changing its mean
 
@@ -154,4 +198,4 @@ class Beta(Module):
         alpha = unit_mean * conc
         beta = (1. - unit_mean) * conc
 
-        return TransformedDistribution(_Beta(alpha, beta), AffineTransform(loc = -1., scale = 2.))
+        return TransformedBeta(_Beta(alpha, beta), AffineTransform(loc = -1., scale = 2.))

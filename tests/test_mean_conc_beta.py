@@ -6,8 +6,9 @@ param = pytest.mark.parametrize
 
 import torch
 from torch import tensor
+from torch.distributions import AffineTransform, Beta as _Beta, SigmoidTransform
 
-from mean_conc_beta import Beta, exists
+from mean_conc_beta import Beta, TransformedBeta, exists
 
 # test mean preservation
 
@@ -167,3 +168,59 @@ def test_multi_dim_batch():
 
     lp = beta.log_prob(dist, sample)
     assert lp.shape == (4, 16)
+
+# test transformed beta
+
+def test_transformed_beta_properties():
+    beta = Beta()
+    params = torch.randn(8, 4, 2)
+    dist = beta(params)
+    base_dist = dist.base_dist
+
+    assert isinstance(dist, TransformedBeta)
+    assert dist.mean.shape == (8, 4)
+    assert dist.mode.shape == (8, 4)
+    assert dist.variance.shape == (8, 4)
+    assert dist.stddev.shape == (8, 4)
+
+    assert torch.allclose(dist.mean, base_dist.mean * 2. - 1., atol = 1e-5)
+    assert torch.allclose(dist.variance, base_dist.variance * 4., atol = 1e-5)
+    assert torch.allclose(dist.entropy(), base_dist.entropy() + math.log(2.), atol = 1e-5)
+
+def test_transformed_beta_arbitrary_affine():
+    base_dist = _Beta(tensor([2., 3.]), tensor([3., 2.]))
+    transform = AffineTransform(loc = 1., scale = 3.)
+    dist = TransformedBeta(base_dist, transform)
+
+    assert torch.allclose(dist.mean, transform(base_dist.mean))
+    assert torch.allclose(dist.mode, transform(base_dist.mode))
+    assert torch.allclose(dist.variance, base_dist.variance * 9.)
+    assert torch.allclose(dist.entropy(), base_dist.entropy() + math.log(3.))
+
+def test_transformed_beta_rejects_non_affine():
+    with raises(AssertionError):
+        TransformedBeta(_Beta(tensor([2.]), tensor([3.])), SigmoidTransform())
+
+# test temperature
+
+def test_temperature():
+    beta = Beta()
+    params = torch.randn(8, 4, 2)
+    action = torch.rand(8, 4)
+
+    sharp = beta(params, temperature = 0.5)
+    wide = beta(params, temperature = 2.)
+    assert sharp.entropy().mean() < wide.entropy().mean()
+
+    assert torch.allclose(beta.mode(params, temperature = 0.5), sharp.mode)
+    assert torch.allclose(beta.entropy(params, temperature = 0.5), sharp.entropy().sum(dim = -1))
+    assert torch.allclose(beta.log_prob(params, action, temperature = 0.5), beta.log_prob(sharp, action))
+
+    assert beta.sample(params, (2,), temperature = 0.5).shape == (2, 8, 4)
+    assert beta.rsample(params, (2,), temperature = 0.5).shape == (2, 8, 4)
+
+    with raises(AssertionError):
+        beta(params, temperature = 0.)
+
+    with raises(AssertionError):
+        beta(params, temperature = -1.)
