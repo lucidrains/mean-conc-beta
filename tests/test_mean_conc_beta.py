@@ -8,21 +8,32 @@ import torch
 from torch import tensor
 from torch.distributions import AffineTransform, Beta as _Beta, SigmoidTransform
 
-from mean_conc_beta import Beta, TransformedBeta, exists
+import gymnasium as gym
+
+from mean_conc_beta import Beta
+from mean_conc_beta.mean_conc_beta import (
+    TransformedBeta,
+    exists,
+    rescale_from_to
+)
 
 # test mean preservation
 
+@param('val_range', [(-1., 1.), (0., 1.)])
 @param('pos_fn', ['exp', 'softplus'])
 @param('detach_unimodal', [True, False])
-def test_mean_preservation(pos_fn, detach_unimodal):
-    beta = Beta(pos_fn = pos_fn, init_conc = 10.0, detach_unimodal = detach_unimodal)
+def test_mean_preservation(val_range, pos_fn, detach_unimodal):
+    beta = Beta(pos_fn = pos_fn, init_conc = 10.0, detach_unimodal = detach_unimodal, val_range = val_range)
 
-    for target_m in [-0.8, -0.5, 0.0, 0.5, 0.8]:
-        raw_m = math.atanh(target_m)
+    targets = [-0.8, -0.5, 0.0, 0.5, 0.8] if val_range == (-1., 1.) else [0.1, 0.25, 0.5, 0.75, 0.9]
+
+    for target_m in targets:
+        unit_target = (target_m + 1.) / 2. if val_range == (-1., 1.) else target_m
+        raw_m = math.atanh(unit_target * 2. - 1.)
         params = tensor([[raw_m, 0.0]])
         dist = beta(params)
 
-        true_mean = dist.base_dist.mean.item() * 2. - 1.
+        true_mean = dist.mean.item()
         det_mean = beta.mean(params).item()
 
         assert abs(true_mean - target_m) < 1e-5
@@ -30,17 +41,19 @@ def test_mean_preservation(pos_fn, detach_unimodal):
 
 # test unimodality under extreme latents
 
+@param('val_range', [(-1., 1.), (0., 1.)])
 @param('pos_fn', ['exp', 'softplus'])
-def test_unimodality_extreme_latents(pos_fn):
-    beta = Beta(pos_fn = pos_fn)
+def test_unimodality_extreme_latents(val_range, pos_fn):
+    beta = Beta(pos_fn = pos_fn, val_range = val_range)
 
     # extreme negative and positive raw means
 
     params = tensor([[[-100.0, 0.0], [100.0, 0.0]], [[0.0, -10.0], [0.0, 10.0]]])
     dist = beta(params)
 
-    alpha = dist.base_dist.concentration1
-    beta_param = dist.base_dist.concentration0
+    base_dist = getattr(dist, 'base_dist', dist)
+    alpha = base_dist.concentration1
+    beta_param = base_dist.concentration0
 
     assert (alpha > 1.0).all()
     assert (beta_param > 1.0).all()
@@ -224,3 +237,241 @@ def test_temperature():
 
     with raises(AssertionError):
         beta(params, temperature = -1.)
+
+# test 0 to 1 range
+
+def test_unit_range_defaults_and_initialization():
+    default_beta = Beta()
+    assert default_beta.range == (-1.0, 1.0)
+    assert default_beta.val_range == (-1.0, 1.0)
+    assert default_beta.loc == -1.0
+    assert default_beta.scale == 2.0
+    assert exists(default_beta.transform)
+
+    unit_beta = Beta(range = (0, 1))
+    assert unit_beta.range == (0.0, 1.0)
+    assert unit_beta.val_range == (0.0, 1.0)
+    assert unit_beta.loc == 0.0
+    assert unit_beta.scale == 1.0
+    assert exists(unit_beta.transform)
+    assert unit_beta.transform.loc == 0.0
+    assert unit_beta.transform.scale == 1.0
+
+    unit_beta_val = Beta(val_range = (0., 1.))
+    assert unit_beta_val.range == (0.0, 1.0)
+    assert unit_beta_val.val_range == (0.0, 1.0)
+    assert exists(unit_beta_val.transform)
+
+    with raises(AssertionError):
+        Beta(range = (1, 0))
+
+    with raises(AssertionError):
+        Beta(range = (1, 1))
+
+def test_unit_range_samples_and_bounds():
+    beta = Beta(range = (0, 1))
+    params = torch.randn(8, 4, 2, requires_grad = True)
+    dist = beta(params)
+
+    assert isinstance(dist, TransformedBeta)
+
+    # samples in (0, 1)
+
+    actions = dist.sample()
+    assert actions.shape == (8, 4)
+    assert ((actions >= 0.0) & (actions <= 1.0)).all()
+
+    # mode in (0, 1)
+
+    mode = beta.mode(params)
+    assert mode.shape == (8, 4)
+    assert ((mode >= 0.0) & (mode <= 1.0)).all()
+    assert torch.allclose(mode, dist.mode)
+
+    # mean in (0, 1)
+
+    mean = beta.mean(params)
+    assert mean.shape == (8, 4)
+    assert ((mean >= 0.0) & (mean <= 1.0)).all()
+    assert torch.allclose(mean, dist.mean)
+
+    # rsample gradient backpropagation
+
+    r_act = dist.rsample()
+    assert ((r_act >= 0.0) & (r_act <= 1.0)).all()
+    loss = r_act.sum()
+    loss.backward()
+    assert exists(params.grad)
+    assert not torch.isnan(params.grad).any()
+
+def test_unit_range_distribution_properties():
+    beta = Beta(range = (0, 1))
+    params = torch.randn(8, 4, 2)
+    dist = beta(params)
+
+    assert isinstance(dist, TransformedBeta)
+    assert ((dist.mean >= 0.0) & (dist.mean <= 1.0)).all()
+    assert ((dist.mode >= 0.0) & (dist.mode <= 1.0)).all()
+    assert (dist.variance >= 0.0).all()
+    assert (dist.stddev >= 0.0).all()
+    assert not torch.isnan(dist.entropy()).any()
+
+def test_unit_range_entropy_and_log_prob():
+    beta = Beta(range = (0, 1))
+    params = torch.randn(8, 4, 2)
+    dist = beta(params)
+
+    actions = dist.sample()
+    assert ((actions >= 0.0) & (actions <= 1.0)).all()
+
+    # log prob matches native Beta log_prob directly (no Jacobian shift)
+
+    lp = beta.log_prob(dist, actions, sum_action_dim = False)
+    assert torch.allclose(lp, dist.log_prob(actions), atol = 1e-5)
+
+    lp_sum = beta.log_prob(dist, actions, sum_action_dim = True)
+    assert lp_sum.shape == (8,)
+
+    # entropy matches native Beta entropy directly
+
+    ent = beta.entropy(dist, sum_action_dim = False)
+    assert torch.allclose(ent, dist.entropy(), atol = 1e-5)
+
+    ent_sum = beta.entropy(dist, sum_action_dim = True)
+    assert ent_sum.shape == (8,)
+
+def test_unit_range_temperature():
+    beta = Beta(range = (0, 1))
+    params = torch.randn(8, 4, 2)
+    action = torch.rand(8, 4)
+
+    sharp = beta(params, temperature = 0.5)
+    wide = beta(params, temperature = 2.)
+    assert sharp.entropy().mean() < wide.entropy().mean()
+
+    assert torch.allclose(beta.mode(params, temperature = 0.5), sharp.mode)
+    assert torch.allclose(beta.entropy(params, temperature = 0.5), sharp.entropy().sum(dim = -1))
+    assert torch.allclose(beta.log_prob(params, action, temperature = 0.5), beta.log_prob(sharp, action))
+
+    assert beta.sample(params, (2,), temperature = 0.5).shape == (2, 8, 4)
+    assert beta.rsample(params, (2,), temperature = 0.5).shape == (2, 8, 4)
+
+def test_arbitrary_range():
+    beta = Beta(range = (-2., 2.))
+    assert beta.range == (-2.0, 2.0)
+    params = torch.randn(8, 4, 2)
+    dist = beta(params)
+    actions = dist.sample()
+    assert ((actions >= -2.0) & (actions <= 2.0)).all()
+    assert torch.allclose(beta.mean(params), dist.mean, atol = 1e-5)
+    assert torch.allclose(beta.mode(params), dist.mode, atol = 1e-5)
+    assert torch.allclose(beta.entropy(dist, sum_action_dim = False), dist.base_dist.entropy() + math.log(4.0), atol = 1e-4)
+
+# test rescale env step with gymnasium
+
+@param('val_range', [(-1., 1.), (0., 1.)])
+@param('target_range', [(-2.0, 2.0), 2.0])
+def test_rescale_env_step_gym(val_range, target_range):
+    env = gym.make('Pendulum-v1')
+    env.reset(seed = 42)
+
+    beta = Beta(range = val_range)
+    step = beta.rescale_env_step(env.step, target_range = target_range)
+
+    action = beta.sample(torch.randn(1, 2)).numpy()
+    obs, reward, terminated, truncated, info = step(action)
+
+    assert obs.shape == (3,)
+    assert exists(reward)
+
+    env.close()
+
+def test_rescale_env_step_values():
+    beta = Beta()
+    step = beta.rescale_env_step(lambda a: a, target_range = (-0.4, 0.4))
+    assert torch.allclose(step(tensor([-1.0, 0.0, 1.0])), tensor([-0.4, 0.0, 0.4]))
+
+def test_rescale_env_step_raw_scale():
+    beta = Beta()
+    step = beta.rescale_env_step(lambda a: a, 0.4)
+    assert torch.allclose(step(tensor([-1.0, 0.0, 1.0])), tensor([-0.4, 0.0, 0.4]))
+
+def test_rescale_env_step_preconfigured():
+    beta = Beta(target_range = (-0.4, 0.4))
+    step = beta.rescale_env_step(lambda a: a)
+    assert torch.allclose(step(tensor([-1.0, 1.0])), tensor([-0.4, 0.4]))
+
+def test_rescale_env_step_noop_without_target_range():
+    beta = Beta()
+    identity = lambda a: a
+    assert beta.rescale_env_step(identity) is identity
+
+def test_rescale_from_to():
+    x = tensor([-1.0, 0.0, 1.0])
+    res = rescale_from_to(x, (-1.0, 1.0), (-0.4, 0.4))
+    assert torch.allclose(res, tensor([-0.4, 0.0, 0.4]))
+
+    # raw floats
+    assert rescale_from_to(-1.0, (-1.0, 1.0), (-0.4, 0.4)) == -0.4
+    assert rescale_from_to(1.0, (-1.0, 1.0), (-0.4, 0.4)) == 0.4
+
+# test rescale env step with clipping
+
+def test_rescale_env_step_clipping():
+    beta = Beta()
+    step = beta.rescale_env_step(lambda a: a, scale = 1.5, clip = (-1.0, 1.0))
+    assert torch.allclose(step(tensor([-1.0, 0.0, 1.0])), tensor([-1.0, 0.0, 1.0]))
+
+def test_rescale_env_step_clip_true():
+    beta = Beta()
+    step = beta.rescale_env_step(lambda a: a, scale = 2.0, clip = True)
+    assert torch.allclose(step(tensor([-1.0, 0.2, 1.0])), tensor([-1.0, 0.4, 1.0]))
+
+def test_rescale_env_step_clip_scalar():
+    beta = Beta()
+    step = beta.rescale_env_step(lambda a: a, scale = 2.0, clip = 0.5)
+    assert torch.allclose(step(tensor([-1.0, 0.2, 1.0])), tensor([-0.5, 0.4, 0.5]))
+
+def test_rescale_env_step_clip_numpy():
+    import numpy as np
+    beta = Beta()
+    step = beta.rescale_env_step(lambda a: a, scale = 2.0, clip = (-1.0, 1.0))
+    res = step(np.array([-1.0, 0.2, 1.0]))
+    assert np.allclose(res, np.array([-1.0, 0.4, 1.0]))
+
+def test_rescale_env_step_clip_only():
+    beta = Beta()
+    step = beta.rescale_env_step(lambda a: a, clip = (-0.5, 0.5))
+    assert torch.allclose(step(tensor([-1.0, 0.2, 1.0])), tensor([-0.5, 0.2, 0.5]))
+
+# test detach entropy mean
+
+def test_detach_entropy_mean_default():
+    beta = Beta()
+    assert beta.detach_entropy_mean
+
+def test_detach_entropy_mean_gradient():
+    beta = Beta()
+    params = torch.tensor([[0.5, 0.0]], requires_grad = True)
+    dist = beta(params)
+    ent = dist.entropy()
+    ent.backward()
+    assert torch.allclose(params.grad[0, 0], torch.tensor(0.0), atol = 1e-6)
+    assert not torch.allclose(params.grad[0, 1], torch.tensor(0.0))
+
+    beta_false = Beta(detach_entropy_mean = False)
+    params_false = torch.tensor([[0.5, 0.0]], requires_grad = True)
+    dist_false = beta_false(params_false)
+    ent_false = dist_false.entropy()
+    ent_false.backward()
+    assert not torch.allclose(params_false.grad[0, 0], torch.tensor(0.0))
+
+def test_detach_entropy_mean_unit_range():
+    beta = Beta(range = (0, 1))
+    assert beta.detach_entropy_mean
+    params = torch.tensor([[0.5, 0.0]], requires_grad = True)
+    dist = beta(params)
+    ent = dist.entropy()
+    ent.backward()
+    assert torch.allclose(params.grad[0, 0], torch.tensor(0.0), atol = 1e-6)
+    assert not torch.allclose(params.grad[0, 1], torch.tensor(0.0))
