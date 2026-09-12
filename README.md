@@ -14,7 +14,8 @@ $ pip install mean-conc-beta
 import torch
 from mean_conc_beta import Beta
 
-# pass the bounds of the action space
+# defaults to (-1., 1.), most continuous action spaces are symmetric centered on 0, sometimes off by a scale
+# but you can pass in the custom bounds of the action space
 
 beta = Beta(bounds = (-2., 2.))
 
