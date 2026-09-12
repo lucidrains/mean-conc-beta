@@ -35,8 +35,10 @@ def rescale_from_to(
     to_low, to_high = to_range
 
     if is_tensor(x):
+        device, dtype = x.device, x.dtype
+
         from_low, from_high, to_low, to_high = [
-            torch.as_tensor(t, device = x.device, dtype = x.dtype)
+            torch.as_tensor(t, device = device, dtype = dtype)
             for t in (from_low, from_high, to_low, to_high)
         ]
 
@@ -50,13 +52,34 @@ class TransformedBeta(TransformedDistribution):
         self,
         base_dist: Distribution,
         transform: AffineTransform,
-        entropy_base_dist: Distribution | None = None
+        entropy_base_dist: Distribution | None = None,
+        eps: float = 1e-5
     ):
         assert isinstance(transform, AffineTransform), 'TransformedBeta only supports affine transforms'
         assert transform.event_dim == 0, 'TransformedBeta only supports non-event affine transforms'
 
+        self.eps = eps
         self.entropy_base_dist = default(entropy_base_dist, base_dist)
         super().__init__(base_dist, transform)
+
+    def log_prob(
+        self,
+        value: Tensor,
+        eps: float | None = None
+    ) -> Tensor:
+        device, dtype = value.device, value.dtype
+        eps = default(eps, self.eps)
+
+        loc, scale = [
+            torch.as_tensor(t, device = device, dtype = dtype)
+            for t in (self.transform.loc, self.transform.scale)
+        ]
+
+        min_val = torch.minimum(loc, loc + scale)
+        max_val = torch.maximum(loc, loc + scale)
+
+        value = value.clamp(min = min_val + eps, max = max_val - eps)
+        return super().log_prob(value)
 
     @property
     def transform(self) -> AffineTransform:
@@ -241,10 +264,15 @@ class Beta(Module):
         eps = None,
         temperature: float = 1.
     ) -> Tensor:
-        eps = default(eps, self.eps)
-        action = action.clamp(min = self.min_val + eps, max = self.max_val - eps)
         dist = self.to_dist(params_or_dist, temperature)
-        log_prob = dist.log_prob(action)
+
+        if isinstance(dist, TransformedBeta):
+            log_prob = dist.log_prob(action, eps = eps)
+        else:
+            eps = default(eps, self.eps)
+            action = action.clamp(min = self.min_val + eps, max = self.max_val - eps)
+            log_prob = dist.log_prob(action)
+
         return log_prob.sum(dim = -1) if sum_action_dim else log_prob
 
     def sample(
@@ -300,11 +328,8 @@ class Beta(Module):
 
         base_dist = to_beta(unit_mean, conc)
 
-        if not detach_entropy_mean:
-            return TransformedBeta(base_dist, self.transform)
-
         # detach mean so entropy only regularizes concentration without penalizing non-zero mean actions
 
-        entropy_base_dist = to_beta(unit_mean.detach(), conc)
+        entropy_base_dist = to_beta(unit_mean.detach(), conc) if detach_entropy_mean else None
 
-        return TransformedBeta(base_dist, self.transform, entropy_base_dist = entropy_base_dist)
+        return TransformedBeta(base_dist, self.transform, entropy_base_dist = entropy_base_dist, eps = self.eps)

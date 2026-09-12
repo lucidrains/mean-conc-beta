@@ -135,6 +135,50 @@ def test_entropy_and_log_prob():
     ent = beta.entropy(dist, sum_action_dim = True)
     assert ent.shape == (8,)
 
+@param('val_range', [(-1., 1.), (0., 1.)])
+def test_log_prob_protected_at_bounds(val_range):
+    beta = Beta(val_range = val_range)
+    params = torch.randn(2, requires_grad = True)
+    dist = beta(params)
+
+    min_val, max_val = val_range
+
+    # actions on and beyond the open support boundaries
+
+    actions = tensor([min_val, max_val, min_val - 1., max_val + 1.])
+
+    log_probs = dist.log_prob(actions)
+    assert torch.isfinite(log_probs).all()
+
+    # beyond the bounds is clamped to the same safe point as the bounds
+
+    assert torch.allclose(log_probs[0], log_probs[2])
+    assert torch.allclose(log_probs[1], log_probs[3])
+
+    module_log_probs = beta.log_prob(dist, actions, sum_action_dim = False)
+    assert torch.allclose(module_log_probs, log_probs)
+
+    # ensure backward pass succeeds and produces finite gradients
+    log_probs.sum().backward()
+    assert exists(params.grad)
+    assert torch.isfinite(params.grad).all()
+
+    # test custom eps
+    custom_eps = 1e-3
+    custom_dist_lp = dist.log_prob(actions, eps = custom_eps)
+    custom_mod_lp = beta.log_prob(dist, actions, eps = custom_eps, sum_action_dim = False)
+    assert torch.allclose(custom_dist_lp, custom_mod_lp)
+
+def test_transformed_beta_tensor_bounds():
+    base = _Beta(tensor([2., 3.]), tensor([3., 2.]))
+    transform = AffineTransform(loc = tensor([0., 1.]), scale = tensor([2., 3.]))
+    dist = TransformedBeta(base, transform)
+
+    actions = tensor([[0., 1.], [-1., 5.]])
+    lp = dist.log_prob(actions)
+    assert torch.isfinite(lp).all()
+
+
 # test sample and rsample
 
 def test_sample_and_rsample():
