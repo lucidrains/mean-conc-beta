@@ -62,6 +62,26 @@ class TransformedBeta(TransformedDistribution):
         self.entropy_base_dist = default(entropy_base_dist, base_dist)
         super().__init__(base_dist, transform)
 
+    @property
+    def transform(self) -> AffineTransform:
+        return self.transforms[0]
+
+    @property
+    def low(self) -> float:
+        return self.transform.loc
+
+    @property
+    def high(self) -> float:
+        return self.transform.loc + self.transform.scale
+
+    @property
+    def bounds(self) -> tuple[float, float]:
+        return (self.low, self.high)
+
+    @property
+    def scale(self) -> float:
+        return self.transform.scale
+
     def log_prob(
         self,
         value: Tensor,
@@ -80,10 +100,6 @@ class TransformedBeta(TransformedDistribution):
 
         value = value.clamp(min = min_val + eps, max = max_val - eps)
         return super().log_prob(value)
-
-    @property
-    def transform(self) -> AffineTransform:
-        return self.transforms[0]
 
     @property
     def mean(self) -> Tensor:
@@ -117,7 +133,9 @@ class Beta(Module):
         clamp_exp = (-4., 4.),
         val_range = (-1., 1.),
         range = None,
-        target_range = None
+        target_range = None,
+        bounds = None,
+        clamp_log_conc = None
     ):
         super().__init__()
         assert pos_fn in ('exp', 'softplus'), f'pos_fn must be either exp or softplus, got {pos_fn}'
@@ -131,14 +149,16 @@ class Beta(Module):
         self.detach_unimodal = detach_unimodal
         self.detach_entropy_mean = detach_entropy_mean
 
-        if isinstance(clamp_exp, (int, float)):
+        if exists(clamp_log_conc):
+            clamp_exp = (-float(clamp_log_conc), float(clamp_log_conc))
+        elif isinstance(clamp_exp, (int, float)):
             clamp_exp = (-float(clamp_exp), float(clamp_exp))
 
         self.clamp_exp = clamp_exp
 
-        # range
+        # bounds / range
 
-        val_range = default(range, val_range)
+        val_range = default(bounds, default(range, val_range))
         min_val, max_val = map(float, val_range)
         assert min_val < max_val, f'val_range min ({min_val}) must be less than max ({max_val})'
 
@@ -157,6 +177,22 @@ class Beta(Module):
     @property
     def range(self) -> tuple[float, float]:
         return self.val_range
+
+    @property
+    def low(self) -> float:
+        return self.min_val
+
+    @property
+    def high(self) -> float:
+        return self.max_val
+
+    @property
+    def bounds(self) -> tuple[float, float]:
+        return self.val_range
+
+    @property
+    def clamp_log_conc(self) -> float | None:
+        return self.clamp_exp[1] if exists(self.clamp_exp) else None
 
     @property
     def transform(self) -> AffineTransform:
@@ -318,7 +354,7 @@ class Beta(Module):
 
         # keep the beta unimodal without changing its mean
 
-        min_unit_mean = torch.minimum(unit_mean, 1. - unit_mean).clamp(min = self.eps / 2.)
+        min_unit_mean = torch.minimum(unit_mean, 1. - unit_mean)
 
         if self.detach_unimodal:
             min_unit_mean = min_unit_mean.detach()

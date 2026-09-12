@@ -14,13 +14,15 @@ $ pip install mean-conc-beta
 import torch
 from mean_conc_beta import Beta
 
-beta = Beta()
+# pass the bounds of the action space
+
+beta = Beta(bounds = (-2., 2.))
 
 # network output: (batch, num_actions, 2) for raw mean and concentration
 
 params = torch.randn(16, 4, 2, requires_grad = True)
 
-# distribution on (-1, 1)
+# distribution on the action bounds
 
 dist = beta(params)
 
@@ -29,14 +31,19 @@ dist = beta(params)
 actions = dist.sample()
 actions_reparam = dist.rsample()
 
-# log prob and entropy
+# joint log prob and entropy over the action dimensions
 
-log_prob = beta.log_prob(dist, actions)
-entropy = beta.entropy(dist)
+log_prob = dist.log_prob(actions).sum(dim = -1)
+entropy = dist.entropy().sum(dim = -1)
+
+# auto-rescale actions directly into env.step, with optional clipping
+
+env_step = beta.rescale_env_step(env.step, target_range = (-2.1, 2.1), clip = (-2., 2.))
+next_obs, reward, term, trunc, info = env_step(actions)
 
 # behavior cloning with mse loss on mean
 
-expert_actions = torch.rand(16, 4)
+expert_actions = torch.rand(16, 4) * 4. - 2.
 
 pred_mean = beta.mean(params)
 

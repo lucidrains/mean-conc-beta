@@ -58,6 +58,20 @@ def test_unimodality_extreme_latents(val_range, pos_fn):
     assert (alpha > 1.0).all()
     assert (beta_param > 1.0).all()
 
+# test unimodality under wide action ranges
+
+@param('bounds', [(-2., 2.), (3., 7.)])
+def test_unimodality_wide_bounds(bounds):
+    beta = Beta(bounds = bounds)
+
+    params = tensor([[[-100.0, 0.0], [100.0, 0.0]], [[0.0, -10.0], [0.0, 10.0]]])
+    dist = beta(params)
+
+    base_dist = getattr(dist, 'base_dist', dist)
+
+    assert (base_dist.concentration1 > 1.0).all()
+    assert (base_dist.concentration0 > 1.0).all()
+
 # test detach unimodal floor
 
 def test_detach_unimodal_default_is_true():
@@ -109,6 +123,19 @@ def test_clamp_exp():
 
     beta_custom = Beta(clamp_exp = 5.0)
     assert beta_custom.clamp_exp == (-5.0, 5.0)
+
+def test_clamp_log_conc_alias():
+    beta = Beta(clamp_log_conc = 2.0)
+
+    assert beta.clamp_exp == (-2.0, 2.0)
+    assert beta.clamp_log_conc == 2.0
+
+    conc_huge = beta.concentration(tensor([0.0, 100.0])).item()
+    expected_huge = 10.0 * math.exp(2.0)
+    assert abs(conc_huge - expected_huge) / expected_huge < 1e-4
+
+    assert Beta().clamp_log_conc == 4.0
+    assert Beta(clamp_exp = None).clamp_log_conc is None
 
 def test_init_conc_not_overridden():
     beta_large = Beta(init_conc = 1e6)
@@ -259,6 +286,15 @@ def test_transformed_beta_arbitrary_affine():
     assert torch.allclose(dist.mode, transform(base_dist.mode))
     assert torch.allclose(dist.variance, base_dist.variance * 9.)
     assert torch.allclose(dist.entropy(), base_dist.entropy() + math.log(3.))
+
+def test_transformed_beta_bounds_properties():
+    base_dist = _Beta(tensor([2., 3.]), tensor([3., 2.]))
+    transform = AffineTransform(loc = 1., scale = 3.)
+    dist = TransformedBeta(base_dist, transform)
+
+    assert dist.low == 1.0
+    assert dist.high == 4.0
+    assert dist.bounds == (1.0, 4.0)
 
 def test_transformed_beta_rejects_non_affine():
     with raises(AssertionError):
@@ -416,6 +452,25 @@ def test_arbitrary_range():
     assert torch.allclose(beta.mean(params), dist.mean, atol = 1e-5)
     assert torch.allclose(beta.mode(params), dist.mode, atol = 1e-5)
     assert torch.allclose(beta.entropy(dist, sum_action_dim = False), dist.base_dist.entropy() + math.log(4.0), atol = 1e-4)
+
+def test_bounds_alias_and_properties():
+    beta = Beta(bounds = (-2., 2.))
+
+    assert beta.bounds == (-2.0, 2.0)
+    assert beta.low == -2.0
+    assert beta.high == 2.0
+    assert beta.val_range == (-2.0, 2.0)
+    assert beta.range == (-2.0, 2.0)
+    assert beta.loc == -2.0
+    assert beta.scale == 4.0
+
+    params = torch.randn(8, 4, 2)
+    dist = beta(params)
+
+    actions = dist.sample()
+    assert ((actions >= -2.0) & (actions <= 2.0)).all()
+    assert dist.bounds == (-2.0, 2.0)
+    assert torch.allclose(beta.mean(params), dist.mean, atol = 1e-5)
 
 # test rescale env step with gymnasium
 

@@ -15,6 +15,7 @@ from mean_conc_beta import Beta
 class Actor(nn.Module):
     def __init__(
         self,
+        bounds = (-1., 1.),
         dim_state = 3,
         dim_action = 1,
         dim_hidden = 64,
@@ -28,7 +29,7 @@ class Actor(nn.Module):
             nn.Tanh(),
             nn.Linear(dim_hidden, dim_action * 2)
         )
-        self.distr = Beta(init_conc = 2., detach_entropy_mean = detach_entropy_mean)
+        self.distr = Beta(bounds = bounds, init_conc = 2., detach_entropy_mean = detach_entropy_mean)
 
     def forward(self, x):
         params = self.net(x).view(*x.shape[:-1], -1, 2)
@@ -54,9 +55,8 @@ class Critic(nn.Module):
 
 # evaluation
 
-def evaluate(actor, env, action_scale, num_episodes = 5):
+def evaluate(actor, env, num_episodes = 5):
     scores = []
-    eval_step = actor.distr.rescale_env_step(env.step, action_scale)
 
     for ep in range(num_episodes):
         obs, _ = env.reset(seed = 1000 + ep)
@@ -67,7 +67,7 @@ def evaluate(actor, env, action_scale, num_episodes = 5):
                 params = actor.net(torch.from_numpy(obs).float()).view(1, 2)
                 action = actor.distr.mean(params).numpy()
 
-            obs, reward, terminated, truncated, _ = eval_step(action)
+            obs, reward, terminated, truncated, _ = env.step(action)
             ep_return += reward
 
             if terminated or truncated:
@@ -90,13 +90,12 @@ def train_pendulum(
     num_envs = 16
     env = gym.make_vec('Pendulum-v1', num_envs = num_envs)
     eval_env = gym.make('Pendulum-v1')
-    action_scale = float(env.single_action_space.high[0])
 
-    actor = Actor(detach_entropy_mean = detach_entropy_mean)
+    bounds = (float(env.single_action_space.low[0]), float(env.single_action_space.high[0]))
+
+    actor = Actor(bounds = bounds, detach_entropy_mean = detach_entropy_mean)
     critic = Critic()
     optimizer = AdamW([*actor.parameters(), *critic.parameters()], lr = 1.5e-3)
-
-    train_step = actor.distr.rescale_env_step(env.step, action_scale)
 
     obs, _ = env.reset(seed = 42)
     rollout_len = 200
@@ -113,7 +112,7 @@ def train_pendulum(
             with torch.no_grad():
                 dist = actor(obs_tensor)
                 action = dist.sample()
-                log_prob = actor.distr.log_prob(dist, action)
+                log_prob = dist.log_prob(action).sum(dim = -1)
                 value = critic(obs_tensor)
 
             obs_buf.append(obs)
@@ -121,7 +120,7 @@ def train_pendulum(
             log_prob_buf.append(log_prob.numpy())
             val_buf.append(value.numpy())
 
-            next_obs, rewards, terms, truncs, _ = train_step(action.numpy())
+            next_obs, rewards, terms, truncs, _ = env.step(action.numpy())
 
             reward_buf.append(rewards * 0.1)
             done_buf.append(terms)
@@ -162,13 +161,13 @@ def train_pendulum(
                 idx = perm[start:start + 64]
 
                 dist = actor(flat_obs[idx])
-                new_log_probs = actor.distr.log_prob(dist, flat_actions[idx])
+                new_log_probs = dist.log_prob(flat_actions[idx]).sum(dim = -1)
 
                 ratio = (new_log_probs - flat_log_probs[idx]).exp()
                 surr1 = ratio * flat_advantages[idx]
                 surr2 = ratio.clamp(0.8, 1.2) * flat_advantages[idx]
 
-                policy_loss = -torch.min(surr1, surr2).mean() - entropy_coef * actor.distr.entropy(dist).mean()
+                policy_loss = -torch.min(surr1, surr2).mean() - entropy_coef * dist.entropy().sum(dim = -1).mean()
                 value_loss = 0.5 * ((critic(flat_obs[idx]) - flat_returns[idx]) ** 2).mean()
 
                 loss = policy_loss + value_loss
@@ -177,7 +176,7 @@ def train_pendulum(
                 loss.backward()
                 optimizer.step()
 
-        score = evaluate(actor, eval_env, action_scale)
+        score = evaluate(actor, eval_env)
         pbar.set_description(f'iter {iteration:2d} | eval {score:.1f}')
 
         if score >= -250.:
@@ -202,5 +201,3 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     train_pendulum(detach_entropy_mean = not args.ablate)
-
-

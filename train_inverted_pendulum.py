@@ -14,6 +14,7 @@ from mean_conc_beta import Beta
 class Actor(nn.Module):
     def __init__(
         self,
+        bounds = (-1., 1.),
         dim_state = 4,
         dim_action = 1,
         dim_hidden = 64
@@ -24,7 +25,7 @@ class Actor(nn.Module):
             nn.Tanh(),
             nn.Linear(dim_hidden, dim_action * 2)
         )
-        self.distr = Beta()
+        self.distr = Beta(bounds = bounds)
 
     def forward(self, x):
         params = self.net(x).view(*x.shape[:-1], -1, 2)
@@ -48,7 +49,7 @@ class Critic(nn.Module):
 
 # evaluation
 
-def evaluate(actor, env, action_scale, num_episodes = 5):
+def evaluate(actor, env, num_episodes = 5):
     scores = []
 
     for ep in range(num_episodes):
@@ -60,7 +61,7 @@ def evaluate(actor, env, action_scale, num_episodes = 5):
                 params = actor.net(torch.from_numpy(obs).float()).view(1, 2)
                 action = actor.distr.mean(params).numpy()
 
-            obs, reward, terminated, truncated, _ = env.step(action * action_scale)
+            obs, reward, terminated, truncated, _ = env.step(action)
             ep_return += reward
 
             if terminated or truncated:
@@ -78,9 +79,10 @@ def train_inverted_pendulum():
 
     env = gym.make_vec('InvertedPendulum-v5', num_envs = 8)
     eval_env = gym.make('InvertedPendulum-v5')
-    action_scale = float(env.single_action_space.high[0])
 
-    actor = Actor()
+    bounds = (float(env.single_action_space.low[0]), float(env.single_action_space.high[0]))
+
+    actor = Actor(bounds = bounds)
     critic = Critic()
     optimizer = AdamW([*actor.parameters(), *critic.parameters()], lr = 3e-4)
 
@@ -97,7 +99,7 @@ def train_inverted_pendulum():
             with torch.no_grad():
                 dist = actor(obs_tensor)
                 action = dist.sample()
-                log_prob = actor.distr.log_prob(dist, action)
+                log_prob = dist.log_prob(action).sum(dim = -1)
                 value = critic(obs_tensor)
 
             obs_buf.append(obs)
@@ -105,7 +107,7 @@ def train_inverted_pendulum():
             log_prob_buf.append(log_prob.numpy())
             val_buf.append(value.numpy())
 
-            next_obs, rewards, terms, truncs, _ = env.step(action.numpy() * action_scale)
+            next_obs, rewards, terms, truncs, _ = env.step(action.numpy())
 
             reward_buf.append(rewards)
             done_buf.append(terms | truncs)
@@ -146,13 +148,13 @@ def train_inverted_pendulum():
                 idx = perm[start:start + 64]
 
                 dist = actor(flat_obs[idx])
-                new_log_probs = actor.distr.log_prob(dist, flat_actions[idx])
+                new_log_probs = dist.log_prob(flat_actions[idx]).sum(dim = -1)
 
                 ratio = (new_log_probs - flat_log_probs[idx]).exp()
                 surr1 = ratio * flat_advantages[idx]
                 surr2 = ratio.clamp(0.8, 1.2) * flat_advantages[idx]
 
-                policy_loss = -torch.min(surr1, surr2).mean() - 0.005 * actor.distr.entropy(dist).mean()
+                policy_loss = -torch.min(surr1, surr2).mean() - 0.005 * dist.entropy().sum(dim = -1).mean()
                 value_loss = 0.5 * ((critic(flat_obs[idx]) - flat_returns[idx]) ** 2).mean()
 
                 loss = policy_loss + value_loss
@@ -161,7 +163,7 @@ def train_inverted_pendulum():
                 loss.backward()
                 optimizer.step()
 
-        score = evaluate(actor, eval_env, action_scale)
+        score = evaluate(actor, eval_env)
 
         if score >= 100.:
             break
