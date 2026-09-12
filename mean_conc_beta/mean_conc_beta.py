@@ -124,20 +124,32 @@ class TransformedBeta(TransformedDistribution):
 class Beta(Module):
     def __init__(
         self,
+        bounds = None,
         pos_fn = 'exp',
         init_conc = 10.,
         min_conc = 0.,
         eps = 1e-5,
+        unimodal: bool | float = True,
+        max_unimodal_floor: float | None = 20.,
         detach_unimodal = True,
         detach_entropy_mean = True,
         clamp_exp = (-4., 4.),
         val_range = (-1., 1.),
         range = None,
         target_range = None,
-        bounds = None,
         clamp_log_conc = None
     ):
         super().__init__()
+
+        if isinstance(bounds, str) and isinstance(pos_fn, (tuple, list)):
+            bounds, pos_fn = pos_fn, bounds
+        elif isinstance(bounds, str):
+            pos_fn = bounds
+            bounds = None
+        elif isinstance(pos_fn, (tuple, list)):
+            bounds = pos_fn
+            pos_fn = 'exp'
+
         assert pos_fn in ('exp', 'softplus'), f'pos_fn must be either exp or softplus, got {pos_fn}'
         assert min_conc >= 0., f'min_conc must be non-negative, got {min_conc}'
         assert init_conc > min_conc, f'init_conc ({init_conc}) must be greater than min_conc ({min_conc})'
@@ -146,6 +158,17 @@ class Beta(Module):
         self.init_conc = init_conc
         self.min_conc = min_conc
         self.eps = eps
+
+        if isinstance(unimodal, (int, float)) and not isinstance(unimodal, bool):
+            if unimodal <= 0:
+                unimodal = False
+                max_unimodal_floor = None
+            else:
+                max_unimodal_floor = float(unimodal)
+                unimodal = True
+
+        self.unimodal = unimodal
+        self.max_unimodal_floor = max_unimodal_floor if unimodal else None
         self.detach_unimodal = detach_unimodal
         self.detach_entropy_mean = detach_entropy_mean
 
@@ -352,14 +375,20 @@ class Beta(Module):
 
         conc = self.concentration(params) / temperature
 
-        # keep the beta unimodal without changing its mean
+        # keep the beta unimodal without changing its mean, with optional damping
 
-        min_unit_mean = torch.minimum(unit_mean, 1. - unit_mean)
+        if self.unimodal:
+            min_unit_mean = torch.minimum(unit_mean, 1. - unit_mean)
 
-        if self.detach_unimodal:
-            min_unit_mean = min_unit_mean.detach()
+            if self.detach_unimodal:
+                min_unit_mean = min_unit_mean.detach()
 
-        conc = conc + 1. / min_unit_mean
+            floor = 1. / min_unit_mean
+
+            if exists(self.max_unimodal_floor):
+                floor = floor.clamp(max = self.max_unimodal_floor)
+
+            conc = conc + floor
 
         def to_beta(unit_mean, conc):
             return _Beta(unit_mean * conc, (1. - unit_mean) * conc)

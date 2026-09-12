@@ -15,9 +15,9 @@ import torch
 from mean_conc_beta import Beta
 
 # defaults to (-1., 1.), most continuous action spaces are symmetric centered on 0, sometimes off by a scale
-# but you can pass in the custom bounds of the action space
+# but you can pass in custom bounds, e.g. Beta((-0.4, 0.4))
 
-beta = Beta(bounds = (-2., 2.))
+beta = Beta()
 
 # network output: (batch, num_actions, 2) for raw mean and concentration
 
@@ -44,7 +44,7 @@ next_obs, reward, term, trunc, info = env_step(actions)
 
 # behavior cloning with mse loss on mean
 
-expert_actions = torch.rand(16, 4) * 4. - 2.
+expert_actions = torch.rand(16, 4) * 2. - 1.
 
 pred_mean = beta.mean(params)
 
