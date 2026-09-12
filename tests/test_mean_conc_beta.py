@@ -92,17 +92,18 @@ def test_clamp_exp():
 
     # raw_conc = 0 preserves exact init_conc
 
-    assert abs(beta.concentration(tensor(0.0)).item() - 10.0) < 1e-5
+    assert abs(beta.concentration(tensor([0.0, 0.0])).item() - 10.0) < 1e-5
+    assert abs(beta.concentration(tensor(0.0), indexed = True).item() - 10.0) < 1e-5
 
     # raw_conc = 100 is clamped to 4.0, yielding init_conc * exp(4.0)
 
-    conc_huge = beta.concentration(tensor(100.0)).item()
+    conc_huge = beta.concentration(tensor([0.0, 100.0])).item()
     expected_huge = 10.0 * math.exp(4.0)
     assert abs(conc_huge - expected_huge) / expected_huge < 1e-4
 
     # raw_conc = -100 is clamped to -4.0, yielding init_conc * exp(-4.0)
 
-    conc_tiny = beta.concentration(tensor(-100.0)).item()
+    conc_tiny = beta.concentration(tensor([0.0, -100.0])).item()
     expected_tiny = 10.0 * math.exp(-4.0)
     assert abs(conc_tiny - expected_tiny) / expected_tiny < 1e-4
 
@@ -111,7 +112,10 @@ def test_clamp_exp():
 
 def test_init_conc_not_overridden():
     beta_large = Beta(init_conc = 1e6)
-    conc_at_zero = beta_large.concentration(tensor(0.0)).item()
+    conc_at_zero = beta_large.concentration(tensor([0.0, 0.0])).item()
+    assert abs(conc_at_zero - 1e6) < 1.0
+
+    conc_at_zero = beta_large.concentration(tensor(0.0), indexed = True).item()
     assert abs(conc_at_zero - 1e6) < 1.0
 
 def test_negative_min_conc_raises():

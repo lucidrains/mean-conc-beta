@@ -211,8 +211,11 @@ class Beta(Module):
 
     def concentration(
         self,
-        raw_conc: Tensor
+        params: Tensor,
+        indexed = False
     ) -> Tensor:
+        raw_conc = params if indexed else params[..., 1]
+
         if self.pos_fn == 'exp':
             if exists(self.clamp_exp):
                 min_val, max_val = self.clamp_exp
@@ -225,9 +228,10 @@ class Beta(Module):
 
     def mean(
         self,
-        params: Tensor
+        params: Tensor,
+        indexed = False
     ) -> Tensor:
-        raw_mean, _ = params.unbind(dim = -1)
+        raw_mean = params if indexed else params[..., 0]
         tanh_mean = raw_mean.tanh()
 
         if self.val_range == (-1., 1.):
@@ -303,8 +307,6 @@ class Beta(Module):
 
         detach_entropy_mean = default(detach_entropy_mean, self.detach_entropy_mean)
 
-        raw_mean, raw_conc = params.unbind(dim = -1)
-
         # map mean onto unit interval
 
         mean = self.mean(params)
@@ -312,7 +314,7 @@ class Beta(Module):
 
         # temperature scales the concentration - lower temperature, sharper policy
 
-        conc = self.concentration(raw_conc) / temperature
+        conc = self.concentration(params) / temperature
 
         # keep the beta unimodal without changing its mean
 
