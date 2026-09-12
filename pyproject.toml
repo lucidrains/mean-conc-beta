@@ -1,6 +1,6 @@
 [project]
 name = "mean-conc-beta"
-version = "0.0.10"
+version = "0.0.11"
 description = "Beta distribution with mean / concentration parameterization, for bounded continuous action spaces in RL"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -25,8 +25,8 @@ classifiers = [
 ]
 
 dependencies = [
-    "torch>=2.5",
-    "torch-einops-utils>=0.1.25"
+    "numpy",
+    "torch>=2.5"
 ]
 
 [project.urls]
@@ -35,8 +35,7 @@ Repository = "https://github.com/lucidrains/mean-conc-beta"
 
 [project.optional-dependencies]
 test = [
-    "gymnasium",
-    "mujoco",
+    "gymnasium[mujoco]",
     "numpy",
     "pytest",
     "tqdm"

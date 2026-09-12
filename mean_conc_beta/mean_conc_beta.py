@@ -1,20 +1,19 @@
 from __future__ import annotations
-from functools import wraps
 import math
+from functools import wraps
 
 import torch
-from torch import Tensor, Size, is_tensor
+from numpy import ndarray
+from torch import Tensor, Size, is_tensor, as_tensor
 import torch.nn.functional as F
 from torch.nn import Module
-
 from torch.distributions import (
     Distribution,
     Beta as _Beta,
     TransformedDistribution,
     AffineTransform
 )
-
-from torch_einops_utils import clamp
+from torch.distributions.kl import kl_divergence
 
 # helpers
 
@@ -24,6 +23,32 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def clamp(x, low, high):
+    if isinstance(x, ndarray):
+        return clamp(as_tensor(x), low, high).numpy()
+
+    if is_tensor(x):
+        device, dtype = x.device, x.dtype
+        low, high = [as_tensor(t, device = device, dtype = dtype) for t in (low, high)]
+
+        return x.clamp(low, high)
+
+    return min(max(x, low), high)
+
+# parses a (low, high) pair or a stack of per-action (low, high) pairs into a tuple of lows and highs
+
+def parse_bounds(bounds):
+    if isinstance(bounds, (tuple, list)) and all(map(is_tensor, bounds)):
+        bounds = torch.stack(bounds, dim = -1)
+    else:
+        bounds = as_tensor(bounds)
+
+    assert bounds.ndim in (1, 2) and bounds.shape[-1] == 2, f'bounds must have shape (2,) or (num_actions, 2), got {tuple(bounds.shape)}'
+
+    low, high = bounds.unbind(dim = -1)
+    assert (low < high).all(), 'lower bounds must be less than upper bounds'
+    return low, high
+
 # linear rescale
 
 def rescale_from_to(
@@ -31,14 +56,17 @@ def rescale_from_to(
     from_range = (-1., 1.),
     to_range = (-1., 1.)
 ):
-    from_low, from_high = from_range
-    to_low, to_high = to_range
+    if isinstance(x, ndarray):
+        return rescale_from_to(as_tensor(x), from_range, to_range).numpy()
+
+    from_low, from_high = parse_bounds(from_range)
+    to_low, to_high = parse_bounds(to_range)
 
     if is_tensor(x):
         device, dtype = x.device, x.dtype
 
         from_low, from_high, to_low, to_high = [
-            torch.as_tensor(t, device = device, dtype = dtype)
+            as_tensor(t, device = device, dtype = dtype)
             for t in (from_low, from_high, to_low, to_high)
         ]
 
@@ -67,19 +95,19 @@ class TransformedBeta(TransformedDistribution):
         return self.transforms[0]
 
     @property
-    def low(self) -> float:
+    def low(self):
         return self.transform.loc
 
     @property
-    def high(self) -> float:
+    def high(self):
         return self.transform.loc + self.transform.scale
 
     @property
-    def bounds(self) -> tuple[float, float]:
-        return (self.low, self.high)
+    def bounds(self):
+        return self.low, self.high
 
     @property
-    def scale(self) -> float:
+    def scale(self):
         return self.transform.scale
 
     def log_prob(
@@ -90,15 +118,12 @@ class TransformedBeta(TransformedDistribution):
         device, dtype = value.device, value.dtype
         eps = default(eps, self.eps)
 
-        loc, scale = [
-            torch.as_tensor(t, device = device, dtype = dtype)
-            for t in (self.transform.loc, self.transform.scale)
+        low, high = [
+            as_tensor(t, device = device, dtype = dtype)
+            for t in self.bounds
         ]
 
-        min_val = torch.minimum(loc, loc + scale)
-        max_val = torch.maximum(loc, loc + scale)
-
-        value = value.clamp(min = min_val + eps, max = max_val - eps)
+        value = value.clamp(min = low + eps, max = high - eps)
         return super().log_prob(value)
 
     @property
@@ -114,8 +139,7 @@ class TransformedBeta(TransformedDistribution):
         return self.base_dist.variance * self.transform.scale ** 2
 
     def entropy(self) -> Tensor:
-        scale = self.transform.scale
-        log_scale = scale.abs().log() if is_tensor(scale) else math.log(abs(scale))
+        log_scale = as_tensor(self.transform.scale).abs().log()
         return self.entropy_base_dist.entropy() + log_scale
 
 # beta distribution policy - unimodal mean-concentration reparameterization on (-1, 1) or (0, 1),
@@ -141,14 +165,8 @@ class Beta(Module):
     ):
         super().__init__()
 
-        if isinstance(bounds, str) and isinstance(pos_fn, (tuple, list)):
-            bounds, pos_fn = pos_fn, bounds
-        elif isinstance(bounds, str):
-            pos_fn = bounds
-            bounds = None
-        elif isinstance(pos_fn, (tuple, list)):
-            bounds = pos_fn
-            pos_fn = 'exp'
+        if isinstance(bounds, str):
+            bounds, pos_fn = (pos_fn if not isinstance(pos_fn, str) else None), bounds
 
         assert pos_fn in ('exp', 'softplus'), f'pos_fn must be either exp or softplus, got {pos_fn}'
         assert min_conc >= 0., f'min_conc must be non-negative, got {min_conc}'
@@ -182,15 +200,9 @@ class Beta(Module):
         # bounds / range
 
         val_range = default(bounds, default(range, val_range))
-        min_val, max_val = map(float, val_range)
-        assert min_val < max_val, f'val_range min ({min_val}) must be less than max ({max_val})'
-
-        self.val_range = (min_val, max_val)
-        self.min_val = min_val
-        self.max_val = max_val
-        self.loc = min_val
-        self.scale = max_val - min_val
-        self.affine_transform = AffineTransform(loc = self.loc, scale = self.scale)
+        self.low, self.high = parse_bounds(val_range)
+        self.loc = self.low
+        self.scale = self.high - self.low
         self.target_range = target_range
 
         # raw offset so concentration at raw_conc = 0 is exactly init_conc
@@ -198,32 +210,16 @@ class Beta(Module):
         self.raw_init_conc = math.log(init_conc - min_conc) if pos_fn == 'exp' else math.log(math.expm1(init_conc - min_conc))
 
     @property
-    def range(self) -> tuple[float, float]:
-        return self.val_range
+    def range(self):
+        return self.bounds
 
     @property
-    def low(self) -> float:
-        return self.min_val
-
-    @property
-    def high(self) -> float:
-        return self.max_val
-
-    @property
-    def bounds(self) -> tuple[float, float]:
-        return self.val_range
+    def bounds(self):
+        return self.low, self.high
 
     @property
     def clamp_log_conc(self) -> float | None:
         return self.clamp_exp[1] if exists(self.clamp_exp) else None
-
-    @property
-    def transform(self) -> AffineTransform:
-        return self.affine_transform
-
-    @property
-    def has_rsample(self) -> bool:
-        return True
 
     # decorate env.step to auto-rescale and clip actions
 
@@ -231,25 +227,27 @@ class Beta(Module):
         self,
         step_fn,
         target_range = None,
-        scale = None,
         clip = None
     ):
-        target_range = default(target_range, default(scale, self.target_range))
+        target_range = default(target_range, self.target_range)
+
+        if exists(target_range):
+            target_range = parse_bounds(target_range)
 
         if clip is True:
-            clip = self.val_range
-        elif isinstance(clip, (int, float)):
-            clip = (-clip, clip)
+            clip = target_range if exists(target_range) else self.bounds
+        elif clip is False:
+            clip = None
+        elif exists(clip):
+            clip = parse_bounds(clip)
 
         if not exists(target_range) and not exists(clip):
             return step_fn
 
         @wraps(step_fn)
         def rescaled_step(action, *args, **kwargs):
-            if isinstance(target_range, (int, float)):
-                action = action * target_range
-            elif exists(target_range):
-                action = rescale_from_to(action, self.val_range, target_range)
+            if exists(target_range):
+                action = rescale_from_to(action, self.bounds, target_range)
 
             if exists(clip):
                 action = clamp(action, *clip)
@@ -287,18 +285,18 @@ class Beta(Module):
 
     def mean(
         self,
-        params: Tensor,
+        params_or_dist: Tensor | Distribution,
         indexed = False
     ) -> Tensor:
-        raw_mean = params if indexed else params[..., 0]
-        tanh_mean = raw_mean.tanh()
+        if isinstance(params_or_dist, Distribution):
+            return params_or_dist.mean
 
-        if self.val_range == (-1., 1.):
-            return tanh_mean.clamp(min = -1. + self.eps, max = 1. - self.eps)
+        raw_mean = params_or_dist if indexed else params_or_dist[..., 0]
+        loc = as_tensor(self.loc, device = raw_mean.device, dtype = raw_mean.dtype)
+        scale = as_tensor(self.scale, device = raw_mean.device, dtype = raw_mean.dtype)
 
-        unit_mean = (tanh_mean + 1.) / 2.
-        mean = unit_mean * self.scale + self.loc
-        return mean.clamp(min = self.min_val + self.eps, max = self.max_val - self.eps)
+        mean = loc + (raw_mean.tanh() + 1.) / 2. * scale
+        return mean.clamp(min = loc + self.eps, max = loc + scale - self.eps)
 
     def mode(
         self,
@@ -319,6 +317,20 @@ class Beta(Module):
         entropy = dist.entropy()
         return entropy.sum(dim = -1) if sum_action_dim else entropy
 
+    def kl_divergence(
+        self,
+        params_or_dist_p: Tensor | Distribution,
+        params_or_dist_q: Tensor | Distribution,
+        sum_action_dim = True,
+        temperature: float = 1.
+    ) -> Tensor:
+        dist_p = self.to_dist(params_or_dist_p, temperature = temperature)
+        dist_q = self.to_dist(params_or_dist_q, temperature = temperature)
+        kl = kl_divergence(dist_p, dist_q)
+        return kl.sum(dim = -1) if sum_action_dim else kl
+
+    kl = kl_divergence
+
     def log_prob(
         self,
         params_or_dist: Tensor | Distribution,
@@ -333,7 +345,11 @@ class Beta(Module):
             log_prob = dist.log_prob(action, eps = eps)
         else:
             eps = default(eps, self.eps)
-            action = action.clamp(min = self.min_val + eps, max = self.max_val - eps)
+            low, high = [
+                as_tensor(b, device = action.device, dtype = action.dtype)
+                for b in self.bounds
+            ]
+            action = action.clamp(min = low + eps, max = high - eps)
             log_prob = dist.log_prob(action)
 
         return log_prob.sum(dim = -1) if sum_action_dim else log_prob
@@ -366,10 +382,13 @@ class Beta(Module):
 
         detach_entropy_mean = default(detach_entropy_mean, self.detach_entropy_mean)
 
+        loc = as_tensor(self.loc, device = params.device, dtype = params.dtype)
+        scale = as_tensor(self.scale, device = params.device, dtype = params.dtype)
+
         # map mean onto unit interval
 
         mean = self.mean(params)
-        unit_mean = (mean - self.loc) / self.scale
+        unit_mean = (mean - loc) / scale
 
         # temperature scales the concentration - lower temperature, sharper policy
 
@@ -399,4 +418,4 @@ class Beta(Module):
 
         entropy_base_dist = to_beta(unit_mean.detach(), conc) if detach_entropy_mean else None
 
-        return TransformedBeta(base_dist, self.transform, entropy_base_dist = entropy_base_dist, eps = self.eps)
+        return TransformedBeta(base_dist, AffineTransform(loc = loc, scale = scale), entropy_base_dist = entropy_base_dist, eps = self.eps)

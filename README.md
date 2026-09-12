@@ -52,6 +52,17 @@ bc_loss = (pred_mean - expert_actions).pow(2).mean()
 bc_loss.backward()
 ```
 
+## Per-action bounds
+
+Bounds must have shape `(2,)` for a single `(low, high)` pair, or `(num_actions, 2)` for a stack of per-action pairs.
+
+```python
+beta = Beta(bounds = [(-1., 1.), (0., 1.), (-2., 2.)])
+
+params = torch.randn(16, 3, 2)
+actions = beta(params).sample()
+```
+
 ## Citations
 
 ```bibtex

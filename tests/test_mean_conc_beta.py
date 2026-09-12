@@ -212,14 +212,29 @@ def test_rescale_env_step():
     step = beta.rescale_env_step(lambda a: a, target_range = (-0.4, 0.4))
     assert torch.allclose(step(tensor([-1., 0., 1.])), tensor([-0.4, 0., 0.4]))
 
-    step = beta.rescale_env_step(lambda a: a, scale = 0.4, clip = 0.5)
+    step = beta.rescale_env_step(lambda a: a, target_range = (-0.4, 0.4), clip = (-0.5, 0.5))
     assert torch.allclose(step(tensor([-1., 0.2, 1.])), tensor([-0.4, 0.08, 0.4]))
 
-    step = beta.rescale_env_step(lambda a: a, scale = 2., clip = True)
-    assert torch.allclose(step(tensor([-1., 0.2, 1.])), tensor([-1., 0.4, 1.]))
+    step = beta.rescale_env_step(lambda a: a, target_range = (-2., 2.), clip = True)
+    assert torch.allclose(step(tensor([-1., 0.2, 1.])), tensor([-2., 0.4, 2.]))
+
+    step = beta.rescale_env_step(lambda a: a, target_range = (-2., 2.), clip = False)
+    assert torch.allclose(step(tensor([-3., 0., 3.])), tensor([-6., 0., 6.]))
 
     identity = lambda a: a
     assert beta.rescale_env_step(identity) is identity
+
+# bounds must be a (low, high) pair or a (num_actions, 2) stack of pairs
+
+def test_invalid_bounds():
+    with raises(AssertionError):
+        Beta(bounds = 0.)
+
+    with raises(AssertionError):
+        Beta(bounds = (-2., 2., 2.))
+
+    with raises(AssertionError):
+        Beta(bounds = ([-1., 0., -2.], [1., 1., 2.]))
 
 def test_rescale_env_step_gym():
     env = gym.make('Pendulum-v1')
@@ -232,3 +247,63 @@ def test_rescale_env_step_gym():
 
     assert obs.shape == (3,)
     env.close()
+
+# e2e - per-action bounds given as a list, tuple, or tensor of pairs
+
+@param('bounds', [
+    [[-1., 1.], [0., 1.], [-2., 2.]],
+    ((-1., 1.), (0., 1.), (-2., 2.)),
+    tensor([[-1., 1.], [0., 1.], [-2., 2.]])
+])
+def test_per_action_bounds(bounds):
+    beta = Beta(bounds = bounds)
+    assert torch.allclose(beta.low, tensor([-1., 0., -2.]))
+    assert torch.allclose(beta.high, tensor([1., 1., 2.]))
+
+    params = torch.randn(8, 3, 2, requires_grad = True)
+    dist = beta(params)
+
+    actions = dist.sample()
+    assert ((actions >= beta.low) & (actions <= beta.high)).all()
+
+    # per-action jacobian shifts entropy by the log scale
+
+    assert torch.allclose(beta.entropy(dist, sum_action_dim = False), dist.base_dist.entropy() + (beta.high - beta.low).log(), atol = 1e-4)
+
+    # ppo style loss and backward
+
+    loss = -beta.log_prob(dist, actions).mean() - beta.entropy(dist).mean()
+    loss.backward()
+    assert torch.isfinite(params.grad).all()
+
+    # kl divergence against a previous policy
+
+    old_params = torch.randn(8, 3, 2)
+    kl = beta.kl_divergence(old_params, params.detach())
+    assert kl.shape == (8,)
+    assert (kl >= 0.).all()
+
+# two-action bounds as a list or tuple of pairs
+
+@param('bounds', [
+    [[-1., 1.], [0., 1.]],
+    ((-1., 1.), (0., 1.))
+])
+def test_two_action_bounds(bounds):
+    beta = Beta(bounds = bounds)
+    assert torch.allclose(beta.low, tensor([-1., 0.]))
+    assert torch.allclose(beta.high, tensor([1., 1.]))
+
+# rescale env step - auto rescale and clip into per-action ranges
+
+def test_per_action_rescale_env_step():
+    beta = Beta()
+    target_range = [[-1., 1.], [0., 1.], [-2., 2.]]
+
+    step = beta.rescale_env_step(lambda a: a, target_range = target_range, clip = True)
+
+    actions = tensor([[-3., -3., -3.], [-1., 0., 0.], [1., 1., 1.], [3., 3., 3.]])
+    expected = tensor([[-1., 0., -2.], [-1., 0.5, 0.], [1., 1., 2.], [1., 1., 2.]])
+
+    assert torch.allclose(step(actions), expected)
+    assert torch.allclose(torch.from_numpy(step(actions.numpy())), expected)
