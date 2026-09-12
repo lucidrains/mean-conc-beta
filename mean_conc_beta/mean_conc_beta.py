@@ -91,7 +91,7 @@ class Beta(Module):
         eps = 1e-5,
         detach_unimodal = True,
         detach_entropy_mean = True,
-        clamp_exp = (-10., 10.),
+        clamp_exp = (-4., 4.),
         val_range = (-1., 1.),
         range = None,
         target_range = None

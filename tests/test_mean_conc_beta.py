@@ -86,22 +86,24 @@ def test_detach_unimodal_gradient():
 # test clamp exp
 
 def test_clamp_exp():
-    beta = Beta(init_conc = 10.0, clamp_exp = (-10.0, 10.0))
+    beta = Beta(init_conc = 10.0)
+
+    assert beta.clamp_exp == (-4.0, 4.0)
 
     # raw_conc = 0 preserves exact init_conc
 
     assert abs(beta.concentration(tensor(0.0)).item() - 10.0) < 1e-5
 
-    # raw_conc = 100 is clamped to 10.0, yielding init_conc * exp(10.0)
+    # raw_conc = 100 is clamped to 4.0, yielding init_conc * exp(4.0)
 
     conc_huge = beta.concentration(tensor(100.0)).item()
-    expected_huge = 10.0 * math.exp(10.0)
+    expected_huge = 10.0 * math.exp(4.0)
     assert abs(conc_huge - expected_huge) / expected_huge < 1e-4
 
-    # raw_conc = -100 is clamped to -10.0, yielding init_conc * exp(-10.0)
+    # raw_conc = -100 is clamped to -4.0, yielding init_conc * exp(-4.0)
 
     conc_tiny = beta.concentration(tensor(-100.0)).item()
-    expected_tiny = 10.0 * math.exp(-10.0)
+    expected_tiny = 10.0 * math.exp(-4.0)
     assert abs(conc_tiny - expected_tiny) / expected_tiny < 1e-4
 
     beta_custom = Beta(clamp_exp = 5.0)
