@@ -2,18 +2,20 @@ from __future__ import annotations
 import math
 from functools import wraps
 
-import torch
 from numpy import ndarray
+
+import torch
 from torch import Tensor, Size, is_tensor, as_tensor
 import torch.nn.functional as F
 from torch.nn import Module
+from torch.distributions.kl import kl_divergence
+
 from torch.distributions import (
     Distribution,
     Beta as _Beta,
     TransformedDistribution,
     AffineTransform
 )
-from torch.distributions.kl import kl_divergence
 
 # helpers
 
@@ -72,6 +74,35 @@ def rescale_from_to(
 
     norm = (x - from_low) / (from_high - from_low)
     return to_low + norm * (to_high - to_low)
+
+# deterministic distribution for temperature = 0 (greedy action)
+
+class Deterministic(Distribution):
+    has_rsample = True
+
+    def __init__(self, value: Tensor):
+        self.value = value
+        super().__init__(batch_shape = value.shape, validate_args = False)
+
+    def rsample(self, sample_shape = ()):
+        return self.value.expand(*sample_shape, *self.batch_shape)
+
+    sample = rsample
+
+    @property
+    def mean(self):
+        return self.value
+
+    @property
+    def mode(self):
+        return self.value
+
+    @property
+    def variance(self):
+        return torch.zeros_like(self.value)
+
+    def entropy(self):
+        return torch.zeros_like(self.value)
 
 # transformed beta distribution
 
@@ -132,7 +163,20 @@ class TransformedBeta(TransformedDistribution):
 
     @property
     def mode(self) -> Tensor:
-        return self.transform(self.base_dist.mode)
+        if not isinstance(self.base_dist, _Beta):
+            return self.transform(self.base_dist.mode)
+
+        alpha, beta = self.base_dist.concentration1, self.base_dist.concentration0
+
+        # beta mode (alpha - 1) / (alpha + beta - 2), snapping to the nearest bound for J / U shapes
+
+        a, b = (alpha - 1.).clamp(min = 0.), (beta - 1.).clamp(min = 0.)
+        total = a + b
+
+        boundary = torch.where(alpha == beta, 0.5, (alpha > beta).float())
+        mode = torch.where(total > 0., a / total.masked_fill(total == 0., 1.), boundary)
+
+        return self.transform(mode)
 
     @property
     def variance(self) -> Tensor:
@@ -141,6 +185,32 @@ class TransformedBeta(TransformedDistribution):
     def entropy(self) -> Tensor:
         log_scale = as_tensor(self.transform.scale).abs().log()
         return self.entropy_base_dist.entropy() + log_scale
+
+# leaky tanh - exact tanh forward, straight through backward with the gradient floored at `leak`,
+# so a mean saturated at a bound can still be pulled back
+
+class LeakyTanh(Module):
+    def __init__(
+        self,
+        leak = 0.1
+    ):
+        super().__init__()
+        assert 0. <= leak <= 1., f'leak factor must be between 0 and 1, got {leak}'
+        self.leak = leak
+
+    def forward(self, x: Tensor) -> Tensor:
+        tanh_x = x.tanh()
+        surrogate = (1. - self.leak) * tanh_x + self.leak * x
+        return surrogate + (tanh_x - surrogate).detach()
+
+# mean squashing functions - map the raw mean from the real line onto (-1, 1)
+
+SQUASH_FNS = dict(
+    tanh = torch.tanh,
+    softsign = F.softsign,
+    algebraic = lambda x: x / (1. + x ** 2).sqrt(),
+    leaky_tanh = LeakyTanh()
+)
 
 # beta distribution policy - unimodal mean-concentration reparameterization on (-1, 1) or (0, 1),
 # an affine shift of a unit-interval beta
@@ -161,7 +231,8 @@ class Beta(Module):
         val_range = (-1., 1.),
         range = None,
         target_range = None,
-        clamp_log_conc = None
+        clamp_log_conc = None,
+        squash_fn = 'leaky_tanh'
     ):
         super().__init__()
 
@@ -172,7 +243,14 @@ class Beta(Module):
         assert min_conc >= 0., f'min_conc must be non-negative, got {min_conc}'
         assert init_conc > min_conc, f'init_conc ({init_conc}) must be greater than min_conc ({min_conc})'
 
+        if isinstance(squash_fn, str):
+            assert squash_fn in SQUASH_FNS, f'squash_fn must be one of {tuple(SQUASH_FNS.keys())}'
+            squash_fn = SQUASH_FNS[squash_fn]
+
+        assert callable(squash_fn), 'squash_fn must be callable'
+
         self.pos_fn = pos_fn
+        self.squash_fn = squash_fn
         self.init_conc = init_conc
         self.min_conc = min_conc
         self.eps = eps
@@ -295,8 +373,12 @@ class Beta(Module):
         loc = as_tensor(self.loc, device = raw_mean.device, dtype = raw_mean.dtype)
         scale = as_tensor(self.scale, device = raw_mean.device, dtype = raw_mean.dtype)
 
-        mean = loc + (raw_mean.tanh() + 1.) / 2. * scale
-        return mean.clamp(min = loc + self.eps, max = loc + scale - self.eps)
+        mean = loc + (self.squash_fn(raw_mean) + 1.) / 2. * scale
+
+        # straight through the eps clamp, so a saturated mean keeps its gradient
+
+        clamped = mean.clamp(min = loc + self.eps, max = loc + scale - self.eps)
+        return mean + (clamped - mean).detach()
 
     def mode(
         self,
@@ -378,17 +460,26 @@ class Beta(Module):
         temperature: float = 1.,
         detach_entropy_mean: bool | None = None
     ) -> Distribution:
-        assert temperature > 0., f'temperature must be positive, got {temperature}'
+        assert temperature >= 0., f'temperature must be non-negative, got {temperature}'
 
         detach_entropy_mean = default(detach_entropy_mean, self.detach_entropy_mean)
 
         loc = as_tensor(self.loc, device = params.device, dtype = params.dtype)
         scale = as_tensor(self.scale, device = params.device, dtype = params.dtype)
 
+        transform = AffineTransform(loc = loc, scale = scale)
+
         # map mean onto unit interval
 
         mean = self.mean(params)
         unit_mean = (mean - loc) / scale
+
+        # deterministic greedy action when temperature is 0
+
+        deterministic = temperature == 0.
+
+        if deterministic:
+            return TransformedBeta(Deterministic(unit_mean), transform)
 
         # temperature scales the concentration - lower temperature, sharper policy
 
@@ -418,4 +509,4 @@ class Beta(Module):
 
         entropy_base_dist = to_beta(unit_mean.detach(), conc) if detach_entropy_mean else None
 
-        return TransformedBeta(base_dist, AffineTransform(loc = loc, scale = scale), entropy_base_dist = entropy_base_dist, eps = self.eps)
+        return TransformedBeta(base_dist, transform, entropy_base_dist = entropy_base_dist, eps = self.eps)

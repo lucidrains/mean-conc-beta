@@ -8,7 +8,7 @@ import torch
 from torch import tensor
 import gymnasium as gym
 
-from mean_conc_beta import Beta
+from mean_conc_beta import Beta, LeakyTanh
 
 # e2e - forward, sample, rsample, log prob, entropy, mode, backward
 
@@ -37,7 +37,7 @@ def test_end_to_end(pos_fn, val_range):
 
 @param('val_range', [(-1., 1.), (0., 1.)])
 def test_mean_preservation(val_range):
-    beta = Beta(val_range = val_range)
+    beta = Beta(val_range = val_range, squash_fn = 'tanh')
     low, high = val_range
 
     unit_means = torch.linspace(0.1, 0.9, 5)
@@ -47,6 +47,50 @@ def test_mean_preservation(val_range):
 
     assert torch.allclose(beta.mean(params), expected, atol = 1e-5)
     assert torch.allclose(beta(params).mean, expected, atol = 1e-5)
+
+# mean squashing functions and leaky tanh
+
+@param('squash_fn', ['tanh', 'softsign', 'algebraic', 'leaky_tanh', LeakyTanh(leak = 0.2)])
+def test_squash_fn(squash_fn):
+    beta = Beta(squash_fn = squash_fn)
+    params = torch.randn(8, 4, 2, requires_grad = True)
+    dist = beta(params)
+
+    assert ((dist.mean >= beta.low) & (dist.mean <= beta.high)).all()
+    assert dist.rsample().shape == (8, 4)
+
+    dist.rsample().sum().backward()
+    assert torch.isfinite(params.grad).all()
+
+def test_squash_fn_boundary_gradient():
+    raw_mean = tensor([10.], requires_grad = True)
+    params = torch.stack([raw_mean, tensor([0.])], dim = -1)
+
+    # tanh vanishes to 0 in float32
+    Beta(squash_fn = 'tanh').mean(params).backward()
+    assert raw_mean.grad.item() == 0.
+
+    # non-saturating alternatives keep gradient alive
+    for fn in ('softsign', 'algebraic', 'leaky_tanh'):
+        raw_mean.grad.zero_()
+        Beta(squash_fn = fn).mean(params).backward()
+        assert raw_mean.grad.item() > 1e-4
+
+def test_leaky_tanh():
+    x = tensor([2.], requires_grad = True)
+
+    # forward is exactly tanh, backward is floored at leak
+    out = LeakyTanh(leak = 0.1)(x)
+    assert torch.allclose(out, tensor([2.]).tanh(), atol = 1e-6)
+
+    out.backward()
+    assert torch.allclose(x.grad, tensor([0.9 * (1. - math.tanh(2.) ** 2) + 0.1]))
+
+    with raises(AssertionError):
+        LeakyTanh(-0.1)
+
+    with raises(AssertionError):
+        Beta(squash_fn = 'unknown')
 
 # unbounded floor forces alpha, beta > 1, default damping avoids U shapes
 
@@ -67,7 +111,7 @@ def test_unimodality(pos_fn, val_range):
 def test_detach_unimodal():
     def raw_mean_grad(detach):
         raw_mean = tensor([5.], requires_grad = True)
-        beta = Beta(detach_unimodal = detach, max_unimodal_floor = None)
+        beta = Beta(detach_unimodal = detach, max_unimodal_floor = None, squash_fn = 'tanh')
         params = torch.stack([raw_mean, tensor([0.])], dim = -1)
         beta.log_prob(beta(params), tensor([0.])).backward()
         return raw_mean.grad.abs().item()
@@ -137,7 +181,67 @@ def test_temperature():
     assert beta.rsample(params, (2,), temperature = 0.5).shape == (2, 8, 4)
 
     with raises(AssertionError):
-        beta(params, temperature = 0.)
+        beta(params, temperature = -1.)
+
+# temperature = 0 is greedy / deterministic evaluation
+
+def test_temperature_zero():
+    beta = Beta()
+    params = torch.randn(8, 4, 2, requires_grad = True)
+    expected_mean = beta.mean(params)
+
+    dist = beta(params, temperature = 0.)
+    assert torch.allclose(dist.mean, expected_mean)
+    assert torch.allclose(dist.mode, expected_mean)
+    assert torch.allclose(dist.sample(), expected_mean)
+    assert torch.allclose(dist.rsample(), expected_mean)
+    assert torch.allclose(dist.variance, torch.zeros_like(expected_mean))
+    assert dist.sample((3,)).shape == (3, 8, 4)
+
+    # module shortcuts
+    assert torch.allclose(beta.sample(params, temperature = 0.), expected_mean)
+    assert torch.allclose(beta.rsample(params, temperature = 0.), expected_mean)
+    assert torch.allclose(beta.mode(params, temperature = 0.), expected_mean)
+
+    # backward works through rsample
+    dist.rsample().sum().backward()
+    assert torch.isfinite(params.grad).all()
+
+    # per-action bounds
+    bounds = [[-1., 1.], [0., 1.], [-2., 2.]]
+    beta_per_action = Beta(bounds = bounds)
+    params_per_action = torch.randn(5, 3, 2)
+    dist_pa = beta_per_action(params_per_action, temperature = 0.)
+    actions = dist_pa.sample()
+    assert ((actions >= beta_per_action.low) & (actions <= beta_per_action.high)).all()
+
+# mode handles non-unimodal distributions (alpha <= 1 or beta <= 1)
+
+@param('bounds', [(-1., 1.), (0., 1.)])
+def test_non_unimodal_mode(bounds):
+    beta = Beta(bounds = bounds, unimodal = False)
+    low, high = bounds
+
+    # (unit mean, concentration) -> alpha = unit mean * conc, beta = (1 - unit mean) * conc
+    # J shape: alpha > 1, beta <= 1 -> high bound; alpha <= 1, beta > 1 -> low bound
+    # U shape: alpha, beta < 1 -> nearest bound
+
+    cases = [
+        (0.8, 1.5, 1.),
+        (0.2, 1.5, 0.),
+        (0.8, 0.5, 1.),
+        (0.2, 0.5, 0.)
+    ]
+
+    for unit_mean, conc, expected in cases:
+        params = tensor([[math.atanh(unit_mean * 2. - 1.), math.log(conc / beta.init_conc)]])
+        expected_mode = low + expected * (high - low)
+        assert torch.allclose(beta.mode(params), tensor([expected_mode]), atol = 1e-4)
+
+    # uniform is finite, does not NaN
+
+    params = tensor([[0., math.log(2. / beta.init_conc)]])
+    assert torch.isfinite(beta.mode(params)).all()
 
 # unit range is exactly the native beta, no jacobian shift
 

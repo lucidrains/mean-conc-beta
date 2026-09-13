@@ -1,1 +1,1 @@
-from mean_conc_beta.mean_conc_beta import Beta, TransformedBeta
+from mean_conc_beta.mean_conc_beta import Beta, TransformedBeta, LeakyTanh

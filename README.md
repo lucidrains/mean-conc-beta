@@ -63,6 +63,19 @@ params = torch.randn(16, 3, 2)
 actions = beta(params).sample()
 ```
 
+## Mean Squashing
+
+The raw mean is squashed onto the bounds with `LeakyTanh` by default - the exact `tanh` forward, with the backward gradient floored at `leak` so a policy saturated at a bound can still be pulled back. It can be swapped for plain `tanh` or any other squash:
+
+```python
+from mean_conc_beta import Beta, LeakyTanh
+
+beta = Beta(squash_fn = 'tanh')
+beta = Beta(squash_fn = LeakyTanh(leak = 0.1))
+beta = Beta(squash_fn = 'softsign')
+beta = Beta(squash_fn = lambda x: x / (1. + x ** 2).sqrt())
+```
+
 ## Citations
 
 ```bibtex
