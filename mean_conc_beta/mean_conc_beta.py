@@ -8,14 +8,13 @@ import torch
 from torch import Tensor, Size, is_tensor, as_tensor
 import torch.nn.functional as F
 from torch.nn import Module
-from torch.distributions.kl import kl_divergence
-
 from torch.distributions import (
     Distribution,
     Beta as _Beta,
     TransformedDistribution,
     AffineTransform
 )
+from torch.distributions.kl import kl_divergence, register_kl
 
 # helpers
 
@@ -25,21 +24,32 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def inv_softplus(y: float) -> float:
+    # exact inverse of softplus, switching to the asymptotic form for large y where expm1 overflows
+
+    return math.log(math.expm1(y)) if y < 20. else y + math.log(-math.expm1(-y))
+
+def parse_sample_shape(sample_shape) -> Size:
+    return Size((sample_shape,) if isinstance(sample_shape, int) else sample_shape)
+
 def clamp(x, low, high):
     if isinstance(x, ndarray):
         return clamp(as_tensor(x), low, high).numpy()
 
-    if is_tensor(x):
-        device, dtype = x.device, x.dtype
-        low, high = [as_tensor(t, device = device, dtype = dtype) for t in (low, high)]
+    if not any(map(is_tensor, (x, low, high))):
+        return min(max(x, low), high)
 
-        return x.clamp(low, high)
+    device = next((t.device for t in (x, low, high) if is_tensor(t)), None)
+    dtype = next((t.dtype for t in (x, low, high) if is_tensor(t)), None)
+    x, low, high = [as_tensor(t, device = device, dtype = dtype) for t in (x, low, high)]
 
-    return min(max(x, low), high)
+    return x.clamp(min = low, max = high)
 
-# parses a (low, high) pair or a stack of per-action (low, high) pairs into a tuple of lows and highs
+# bounds
 
 def parse_bounds(bounds):
+    # parses a (low, high) pair or a stack of per-action pairs into a tuple of lows and highs
+
     if isinstance(bounds, (tuple, list)) and all(map(is_tensor, bounds)):
         bounds = torch.stack(bounds, dim = -1)
     else:
@@ -79,15 +89,19 @@ def rescale_from_to(
 
 class Deterministic(Distribution):
     has_rsample = True
+    arg_constraints = {}
 
     def __init__(self, value: Tensor):
         self.value = value
         super().__init__(batch_shape = value.shape, validate_args = False)
 
     def rsample(self, sample_shape = ()):
-        return self.value.expand(*sample_shape, *self.batch_shape)
+        return self.value.expand(*parse_sample_shape(sample_shape), *self.batch_shape)
 
     sample = rsample
+
+    def log_prob(self, value: Tensor) -> Tensor:
+        raise NotImplementedError('cannot evaluate log_prob for deterministic distribution (temperature = 0)')
 
     @property
     def mean(self):
@@ -103,6 +117,10 @@ class Deterministic(Distribution):
 
     def entropy(self):
         return torch.zeros_like(self.value)
+
+@register_kl(Deterministic, Deterministic)
+def _kl_deterministic_deterministic(p, q):
+    return torch.where(p.value == q.value, torch.zeros_like(p.value), torch.full_like(p.value, float('inf')))
 
 # transformed beta distribution
 
@@ -120,6 +138,12 @@ class TransformedBeta(TransformedDistribution):
         self.eps = eps
         self.entropy_base_dist = default(entropy_base_dist, base_dist)
         super().__init__(base_dist, transform)
+
+    def sample(self, sample_shape = ()):
+        return super().sample(parse_sample_shape(sample_shape))
+
+    def rsample(self, sample_shape = ()):
+        return super().rsample(parse_sample_shape(sample_shape))
 
     @property
     def transform(self) -> AffineTransform:
@@ -173,7 +197,7 @@ class TransformedBeta(TransformedDistribution):
         a, b = (alpha - 1.).clamp(min = 0.), (beta - 1.).clamp(min = 0.)
         total = a + b
 
-        boundary = torch.where(alpha == beta, 0.5, (alpha > beta).float())
+        boundary = torch.where(alpha == beta, 0.5, (alpha > beta).type_as(alpha))
         mode = torch.where(total > 0., a / total.masked_fill(total == 0., 1.), boundary)
 
         return self.transform(mode)
@@ -183,11 +207,20 @@ class TransformedBeta(TransformedDistribution):
         return self.base_dist.variance * self.transform.scale ** 2
 
     def entropy(self) -> Tensor:
+        if isinstance(self.base_dist, Deterministic):
+            return torch.zeros_like(self.base_dist.value)
+
         log_scale = as_tensor(self.transform.scale).abs().log()
         return self.entropy_base_dist.entropy() + log_scale
 
 # leaky tanh - exact tanh forward, straight through backward with the gradient floored at `leak`,
 # so a mean saturated at a bound can still be pulled back
+
+def leaky_tanh(x: Tensor, leak: float = 0.1) -> Tensor:
+    assert 0. <= leak <= 1., f'leak factor must be between 0 and 1, got {leak}'
+    tanh_x = x.tanh()
+    surrogate = (1. - leak) * tanh_x + leak * x
+    return surrogate + (tanh_x - surrogate).detach()
 
 class LeakyTanh(Module):
     def __init__(
@@ -199,9 +232,7 @@ class LeakyTanh(Module):
         self.leak = leak
 
     def forward(self, x: Tensor) -> Tensor:
-        tanh_x = x.tanh()
-        surrogate = (1. - self.leak) * tanh_x + self.leak * x
-        return surrogate + (tanh_x - surrogate).detach()
+        return leaky_tanh(x, self.leak)
 
 # mean squashing functions - map the raw mean from the real line onto (-1, 1)
 
@@ -236,8 +267,13 @@ class Beta(Module):
     ):
         super().__init__()
 
+        # bounds and pos_fn can be passed in either order
+
         if isinstance(bounds, str):
-            bounds, pos_fn = (pos_fn if not isinstance(pos_fn, str) else None), bounds
+            if isinstance(pos_fn, str):
+                pos_fn, bounds = bounds, None
+            else:
+                pos_fn, bounds = bounds, pos_fn
 
         assert pos_fn in ('exp', 'softplus'), f'pos_fn must be either exp or softplus, got {pos_fn}'
         assert min_conc >= 0., f'min_conc must be non-negative, got {min_conc}'
@@ -247,6 +283,9 @@ class Beta(Module):
             assert squash_fn in SQUASH_FNS, f'squash_fn must be one of {tuple(SQUASH_FNS.keys())}'
             squash_fn = SQUASH_FNS[squash_fn]
 
+        if isinstance(squash_fn, type) and issubclass(squash_fn, Module):
+            squash_fn = squash_fn()
+
         assert callable(squash_fn), 'squash_fn must be callable'
 
         self.pos_fn = pos_fn
@@ -255,13 +294,13 @@ class Beta(Module):
         self.min_conc = min_conc
         self.eps = eps
 
-        if isinstance(unimodal, (int, float)) and not isinstance(unimodal, bool):
+        # a float shorthand for unimodal sets the damping floor
+
+        if not isinstance(unimodal, bool) and isinstance(unimodal, (int, float)):
             if unimodal <= 0:
-                unimodal = False
-                max_unimodal_floor = None
+                unimodal, max_unimodal_floor = False, None
             else:
-                max_unimodal_floor = float(unimodal)
-                unimodal = True
+                unimodal, max_unimodal_floor = True, float(unimodal)
 
         self.unimodal = unimodal
         self.max_unimodal_floor = max_unimodal_floor if unimodal else None
@@ -285,7 +324,8 @@ class Beta(Module):
 
         # raw offset so concentration at raw_conc = 0 is exactly init_conc
 
-        self.raw_init_conc = math.log(init_conc - min_conc) if pos_fn == 'exp' else math.log(math.expm1(init_conc - min_conc))
+        delta_conc = init_conc - min_conc
+        self.raw_init_conc = math.log(delta_conc) if pos_fn == 'exp' else inv_softplus(delta_conc)
 
     @property
     def range(self):
@@ -442,8 +482,7 @@ class Beta(Module):
         sample_shape = (),
         temperature: float = 1.
     ) -> Tensor:
-        sample_shape = Size(sample_shape)
-        return self(params, temperature = temperature).sample(sample_shape)
+        return self(params, temperature = temperature).sample(parse_sample_shape(sample_shape))
 
     def rsample(
         self,
@@ -451,8 +490,7 @@ class Beta(Module):
         sample_shape = (),
         temperature: float = 1.
     ) -> Tensor:
-        sample_shape = Size(sample_shape)
-        return self(params, temperature = temperature).rsample(sample_shape)
+        return self(params, temperature = temperature).rsample(parse_sample_shape(sample_shape))
 
     def forward(
         self,
@@ -476,9 +514,7 @@ class Beta(Module):
 
         # deterministic greedy action when temperature is 0
 
-        deterministic = temperature == 0.
-
-        if deterministic:
+        if temperature == 0.:
             return TransformedBeta(Deterministic(unit_mean), transform)
 
         # temperature scales the concentration - lower temperature, sharper policy

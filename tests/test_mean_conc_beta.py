@@ -1,14 +1,17 @@
 from __future__ import annotations
 import math
+
 import pytest
-param = pytest.mark.parametrize
 from pytest import raises
+
+param = pytest.mark.parametrize
 
 import torch
 from torch import tensor
 import gymnasium as gym
 
-from mean_conc_beta import Beta, LeakyTanh
+from mean_conc_beta import Beta, LeakyTanh, leaky_tanh
+from mean_conc_beta.mean_conc_beta import clamp
 
 # e2e - forward, sample, rsample, log prob, entropy, mode, backward
 
@@ -50,7 +53,7 @@ def test_mean_preservation(val_range):
 
 # mean squashing functions and leaky tanh
 
-@param('squash_fn', ['tanh', 'softsign', 'algebraic', 'leaky_tanh', LeakyTanh(leak = 0.2)])
+@param('squash_fn', ['tanh', 'softsign', 'algebraic', 'leaky_tanh', leaky_tanh, LeakyTanh, LeakyTanh(leak = 0.2)])
 def test_squash_fn(squash_fn):
     beta = Beta(squash_fn = squash_fn)
     params = torch.randn(8, 4, 2, requires_grad = True)
@@ -71,7 +74,7 @@ def test_squash_fn_boundary_gradient():
     assert raw_mean.grad.item() == 0.
 
     # non-saturating alternatives keep gradient alive
-    for fn in ('softsign', 'algebraic', 'leaky_tanh'):
+    for fn in ('softsign', 'algebraic', 'leaky_tanh', leaky_tanh, LeakyTanh):
         raw_mean.grad.zero_()
         Beta(squash_fn = fn).mean(params).backward()
         assert raw_mean.grad.item() > 1e-4
@@ -82,12 +85,16 @@ def test_leaky_tanh():
     # forward is exactly tanh, backward is floored at leak
     out = LeakyTanh(leak = 0.1)(x)
     assert torch.allclose(out, tensor([2.]).tanh(), atol = 1e-6)
+    assert torch.allclose(leaky_tanh(tensor([2.]), leak = 0.1), tensor([2.]).tanh(), atol = 1e-6)
 
     out.backward()
     assert torch.allclose(x.grad, tensor([0.9 * (1. - math.tanh(2.) ** 2) + 0.1]))
 
     with raises(AssertionError):
         LeakyTanh(-0.1)
+
+    with raises(AssertionError):
+        leaky_tanh(x, -0.1)
 
     with raises(AssertionError):
         Beta(squash_fn = 'unknown')
@@ -196,12 +203,28 @@ def test_temperature_zero():
     assert torch.allclose(dist.sample(), expected_mean)
     assert torch.allclose(dist.rsample(), expected_mean)
     assert torch.allclose(dist.variance, torch.zeros_like(expected_mean))
+    assert torch.allclose(dist.entropy(), torch.zeros_like(expected_mean))
+    assert torch.allclose(beta.entropy(params, temperature = 0.), torch.zeros(8))
     assert dist.sample((3,)).shape == (3, 8, 4)
+    assert dist.sample(3).shape == (3, 8, 4)
+
+    # deterministic kl divergence
+    dist_clone = beta(params, temperature = 0.)
+    assert torch.allclose(beta.kl_divergence(dist, dist_clone), torch.zeros(8))
+
+    # deterministic log_prob is not defined
+    with raises(NotImplementedError):
+        dist.log_prob(expected_mean)
+
+    with raises(NotImplementedError):
+        beta.log_prob(dist, expected_mean)
 
     # module shortcuts
     assert torch.allclose(beta.sample(params, temperature = 0.), expected_mean)
     assert torch.allclose(beta.rsample(params, temperature = 0.), expected_mean)
     assert torch.allclose(beta.mode(params, temperature = 0.), expected_mean)
+    assert beta.sample(params, 3, temperature = 0.).shape == (3, 8, 4)
+    assert beta.rsample(params, 3, temperature = 0.).shape == (3, 8, 4)
 
     # backward works through rsample
     dist.rsample().sum().backward()
@@ -272,6 +295,7 @@ def test_concentration_clamp():
     assert math.isclose(beta.concentration(tensor([0., 100.])).item(), 10. * math.exp(4.), rel_tol = 1e-4)
     assert math.isclose(beta.concentration(tensor([0., -100.])).item(), 10. * math.exp(-4.), rel_tol = 1e-4)
     assert math.isclose(Beta(init_conc = 1e6).concentration(tensor([0., 0.])).item(), 1e6, rel_tol = 1e-5)
+    assert math.isclose(Beta(pos_fn = 'softplus', init_conc = 1e6).concentration(tensor([0., 0.])).item(), 1e6, rel_tol = 1e-4)
 
     assert Beta(clamp_exp = 5.).clamp_exp == (-5., 5.)
     assert Beta(clamp_log_conc = 2.).clamp_exp == (-2., 2.)
@@ -411,3 +435,22 @@ def test_per_action_rescale_env_step():
 
     assert torch.allclose(step(actions), expected)
     assert torch.allclose(torch.from_numpy(step(actions.numpy())), expected)
+
+# clamp with mixed scalar and tensor bounds
+
+def test_clamp_mixed():
+    assert torch.allclose(clamp(0.5, tensor([0., -1.]), tensor([1., 1.])), tensor([0.5, 0.5]))
+    assert torch.allclose(clamp(tensor([0.5, -2.]), -1., 1.), tensor([0.5, -1.]))
+
+# sample and rsample with integer sample_shape
+
+def test_sample_shape_int():
+    beta = Beta()
+    params = torch.randn(8, 4, 2)
+    dist = beta(params)
+
+    assert dist.sample(3).shape == (3, 8, 4)
+    assert dist.rsample(3).shape == (3, 8, 4)
+    assert beta.sample(params, 3).shape == (3, 8, 4)
+    assert beta.rsample(params, 3).shape == (3, 8, 4)
+
