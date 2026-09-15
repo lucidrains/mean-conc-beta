@@ -243,6 +243,14 @@ SQUASH_FNS = dict(
     leaky_tanh = LeakyTanh()
 )
 
+# unit mean and concentration to the two beta concentrations
+
+def to_concentrations(unit_mean: Tensor, conc: Tensor) -> tuple[Tensor, Tensor]:
+    return unit_mean * conc, (1. - unit_mean) * conc
+
+def to_beta(unit_mean: Tensor, conc: Tensor) -> _Beta:
+    return _Beta(*to_concentrations(unit_mean, conc))
+
 # beta distribution policy on (-1, 1) or (0, 1), an affine shift of a unit-interval beta,
 # parameterized by a mean and concentration, or the two concentrations directly
 
@@ -408,6 +416,64 @@ class Beta(Module):
         elif self.pos_fn == 'softplus':
             return F.softplus(raw_conc + self.raw_init_conc) + self.min_conc
 
+    # unimodal floors - detached by default so gradients still flow back to the raw params
+
+    def maybe_detach(self, x: Tensor) -> Tensor:
+        return x.detach() if self.detach_unimodal else x
+
+    def floor_total_concentration(self, unit_mean: Tensor, conc: Tensor) -> Tensor:
+        # floor the total concentration at 1 / min(unit mean, 1 - unit mean) so the beta is unimodal,
+        # which preserves the mean
+
+        floor = 1. / torch.minimum(unit_mean, 1. - unit_mean)
+
+        if exists(self.max_unimodal_floor):
+            floor = floor.clamp(max = self.max_unimodal_floor)
+
+        return conc + self.maybe_detach(floor)
+
+    # straight through the eps clamp, so a saturated mean keeps its gradient
+
+    def clamp_unit_mean(self, unit_mean: Tensor) -> Tensor:
+        scale = as_tensor(self.scale, device = unit_mean.device, dtype = unit_mean.dtype)
+        eps = self.eps / scale
+
+        clamped = unit_mean.clamp(min = eps, max = 1. - eps)
+        return unit_mean + (clamped - unit_mean).detach()
+
+    def unit_mean(
+        self,
+        params: Tensor,
+        indexed = False
+    ) -> Tensor:
+        assert not self.param_with_alpha_beta, 'unit_mean is only defined for the mean_conc parameterization'
+
+        raw_mean = params if indexed else params[..., 0]
+        return self.clamp_unit_mean((self.squash_fn(raw_mean) + 1.) / 2.)
+
+    # raw params to the unit mean and total concentration, one pathway per parameterization,
+    # with the unimodal floor applied, which preserves the mean
+
+    def concentrations(
+        self,
+        params: Tensor,
+        temperature: float = 1.
+    ) -> tuple[Tensor, Tensor]:
+        if self.param_with_alpha_beta:
+            alpha = self.concentration(params[..., 0], indexed = True)
+            beta = self.concentration(params[..., 1], indexed = True)
+
+            unit_mean = self.clamp_unit_mean(alpha / (alpha + beta))
+            conc = (alpha + beta) / temperature
+        else:
+            unit_mean = self.unit_mean(params)
+            conc = self.concentration(params[..., 1], indexed = True) / temperature
+
+        if self.unimodal:
+            conc = self.floor_total_concentration(unit_mean, conc)
+
+        return unit_mean, conc
+
     def mean(
         self,
         params_or_dist: Tensor | Distribution,
@@ -416,25 +482,15 @@ class Beta(Module):
         if isinstance(params_or_dist, Distribution):
             return params_or_dist.mean
 
-        if self.param_with_alpha_beta:
-            assert not indexed, 'indexed mean is only defined for the mean_conc parameterization'
-
-            alpha = self.concentration(params_or_dist[..., 0], indexed = True)
-            beta = self.concentration(params_or_dist[..., 1], indexed = True)
-            unit_mean = alpha / (alpha + beta)
+        if indexed:
+            unit_mean = self.unit_mean(params_or_dist, indexed = True)
         else:
-            raw_mean = params_or_dist if indexed else params_or_dist[..., 0]
-            unit_mean = (self.squash_fn(raw_mean) + 1.) / 2.
+            unit_mean, _ = self.concentrations(params_or_dist)
 
         loc = as_tensor(self.loc, device = params_or_dist.device, dtype = params_or_dist.dtype)
         scale = as_tensor(self.scale, device = params_or_dist.device, dtype = params_or_dist.dtype)
 
-        mean = loc + unit_mean * scale
-
-        # straight through the eps clamp, so a saturated mean keeps its gradient
-
-        clamped = mean.clamp(min = loc + self.eps, max = loc + scale - self.eps)
-        return mean + (clamped - mean).detach()
+        return loc + unit_mean * scale
 
     def mode(
         self,
@@ -523,42 +579,21 @@ class Beta(Module):
 
         transform = AffineTransform(loc = loc, scale = scale)
 
-        # map mean onto unit interval
-
-        mean = self.mean(params)
-        unit_mean = (mean - loc) / scale
-
         # deterministic greedy action when temperature is 0
 
         if temperature == 0.:
+            unit_mean, _ = self.concentrations(params)
             return TransformedBeta(Deterministic(unit_mean), transform)
 
-        # temperature scales the concentration - lower temperature, sharper policy
-
-        conc = self.concentration(params) / temperature
-
-        # keep the beta unimodal without changing its mean, with optional damping
-
-        if self.unimodal:
-            min_unit_mean = torch.minimum(unit_mean, 1. - unit_mean)
-
-            if self.detach_unimodal:
-                min_unit_mean = min_unit_mean.detach()
-
-            floor = 1. / min_unit_mean
-
-            if exists(self.max_unimodal_floor):
-                floor = floor.clamp(max = self.max_unimodal_floor)
-
-            conc = conc + floor
-
-        def to_beta(unit_mean, conc):
-            return _Beta(unit_mean * conc, (1. - unit_mean) * conc)
+        unit_mean, conc = self.concentrations(params, temperature = temperature)
 
         base_dist = to_beta(unit_mean, conc)
 
         # detach mean so entropy only regularizes concentration without penalizing non-zero mean actions
 
-        entropy_base_dist = to_beta(unit_mean.detach(), conc) if detach_entropy_mean else None
+        entropy_base_dist = None
+
+        if detach_entropy_mean:
+            entropy_base_dist = to_beta(unit_mean.detach(), conc)
 
         return TransformedBeta(base_dist, transform, entropy_base_dist = entropy_base_dist, eps = self.eps)
