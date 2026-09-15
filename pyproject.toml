@@ -1,6 +1,6 @@
 [project]
 name = "mean-conc-beta"
-version = "0.1.0"
+version = "0.1.1"
 description = "Beta distribution with mean / concentration parameterization, for bounded continuous action spaces in RL"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }

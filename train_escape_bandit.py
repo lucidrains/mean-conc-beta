@@ -8,7 +8,8 @@
 # ///
 
 # escape bandit - reward depends only on the mean of the beta, target flips to the opposite bound
-# halfway through. leaky tanh escapes within the budget, tanh stalls at the first bound
+# halfway through. leaky tanh escapes within the budget, while tanh and the regular alpha / beta
+# parameterization stall at the first bound
 
 from __future__ import annotations
 
@@ -26,8 +27,10 @@ from mean_conc_beta import Beta
 # training
 
 def train(
-    squash_fn,
     seed,
+    squash_fn = 'leaky_tanh',
+    param_with_alpha_beta = False,
+    unimodal = True,
     iterations = 300,
     batch_size = 512,
     dim_hidden = 64,
@@ -43,7 +46,13 @@ def train(
         nn.Linear(dim_hidden, 2)
     )
 
-    distr = Beta(init_conc = 2., squash_fn = squash_fn, detach_entropy_mean = detach_entropy_mean)
+    distr = Beta(
+        init_conc = 2.,
+        squash_fn = squash_fn,
+        param_with_alpha_beta = param_with_alpha_beta,
+        unimodal = unimodal,
+        detach_entropy_mean = detach_entropy_mean
+    )
     optimizer = AdamW(net.parameters(), lr = lr)
 
     def params(obs):
@@ -91,31 +100,37 @@ def main(
         "A policy is trained to sit at the [cyan]+1.0[/cyan] bound until saturated.\n"
         "Halfway through, the target abruptly flips to the opposite bound ([cyan]-1.0[/cyan]).\n\n"
         "• [yellow]tanh[/yellow]: vanishing gradients (sech² ≈ 0) at the boundary leave the policy trapped.\n"
-        "• [green]leaky_tanh[/green]: straight-through gradient floor allows the policy to escape to -1.0.",
+        "• [green]leaky_tanh[/green]: straight-through gradient floor allows the policy to escape to -1.0.\n"
+        "• [red]alpha_beta[/red]: no separate mean parameter, so the saturated mean cannot be pulled back.",
         title = "Experiment",
         border_style = "bright_blue"
     ))
     console.print()
 
-    variants = ['tanh', 'leaky_tanh']
+    variants = dict(
+        tanh = dict(squash_fn = 'tanh'),
+        leaky_tanh = dict(squash_fn = 'leaky_tanh'),
+        alpha_beta = dict(param_with_alpha_beta = True)
+    )
+
     results = {
         name: [
             train(
-                name,
                 seed,
                 iterations = iterations,
                 batch_size = batch_size,
                 lr = lr,
                 entropy_coef = entropy_coef,
-                detach_entropy_mean = detach_entropy_mean
+                detach_entropy_mean = detach_entropy_mean,
+                **kwargs
             )
             for seed in range(seeds)
         ]
-        for name in variants
+        for name, kwargs in variants.items()
     }
 
     table = Table(title = f"Escape Rate ({seeds} Seeds)", border_style = "bright_black")
-    table.add_column("Squash Function", style = "bold")
+    table.add_column("Variant", style = "bold")
     table.add_column("Escaped", justify = "right")
     table.add_column("Trapped", justify = "right")
 

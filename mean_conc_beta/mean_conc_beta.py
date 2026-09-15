@@ -243,8 +243,8 @@ SQUASH_FNS = dict(
     leaky_tanh = LeakyTanh()
 )
 
-# beta distribution policy - unimodal mean-concentration reparameterization on (-1, 1) or (0, 1),
-# an affine shift of a unit-interval beta
+# beta distribution policy on (-1, 1) or (0, 1), an affine shift of a unit-interval beta,
+# parameterized by a mean and concentration, or the two concentrations directly
 
 class Beta(Module):
     def __init__(
@@ -263,7 +263,8 @@ class Beta(Module):
         range = None,
         target_range = None,
         clamp_log_conc = None,
-        squash_fn = 'leaky_tanh'
+        squash_fn = 'leaky_tanh',
+        param_with_alpha_beta = False
     ):
         super().__init__()
 
@@ -293,6 +294,7 @@ class Beta(Module):
         self.init_conc = init_conc
         self.min_conc = min_conc
         self.eps = eps
+        self.param_with_alpha_beta = param_with_alpha_beta
 
         # a float shorthand for unimodal sets the damping floor
 
@@ -389,6 +391,11 @@ class Beta(Module):
         params: Tensor,
         indexed = False
     ) -> Tensor:
+        if self.param_with_alpha_beta and not indexed:
+            alpha = self.concentration(params[..., 0], indexed = True)
+            beta = self.concentration(params[..., 1], indexed = True)
+            return alpha + beta
+
         raw_conc = params if indexed else params[..., 1]
 
         if self.pos_fn == 'exp':
@@ -409,11 +416,20 @@ class Beta(Module):
         if isinstance(params_or_dist, Distribution):
             return params_or_dist.mean
 
-        raw_mean = params_or_dist if indexed else params_or_dist[..., 0]
-        loc = as_tensor(self.loc, device = raw_mean.device, dtype = raw_mean.dtype)
-        scale = as_tensor(self.scale, device = raw_mean.device, dtype = raw_mean.dtype)
+        if self.param_with_alpha_beta:
+            assert not indexed, 'indexed mean is only defined for the mean_conc parameterization'
 
-        mean = loc + (self.squash_fn(raw_mean) + 1.) / 2. * scale
+            alpha = self.concentration(params_or_dist[..., 0], indexed = True)
+            beta = self.concentration(params_or_dist[..., 1], indexed = True)
+            unit_mean = alpha / (alpha + beta)
+        else:
+            raw_mean = params_or_dist if indexed else params_or_dist[..., 0]
+            unit_mean = (self.squash_fn(raw_mean) + 1.) / 2.
+
+        loc = as_tensor(self.loc, device = params_or_dist.device, dtype = params_or_dist.dtype)
+        scale = as_tensor(self.scale, device = params_or_dist.device, dtype = params_or_dist.dtype)
+
+        mean = loc + unit_mean * scale
 
         # straight through the eps clamp, so a saturated mean keeps its gradient
 
