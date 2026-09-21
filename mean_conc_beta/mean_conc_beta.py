@@ -24,6 +24,9 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def straight_through(x: Tensor, y: Tensor) -> Tensor:
+    return x + (y - x).detach()
+
 def inv_softplus(y: float) -> float:
     # exact inverse of softplus, switching to the asymptotic form for large y where expm1 overflows
 
@@ -220,7 +223,7 @@ def leaky_tanh(x: Tensor, leak: float = 0.1) -> Tensor:
     assert 0. <= leak <= 1., f'leak factor must be between 0 and 1, got {leak}'
     tanh_x = x.tanh()
     surrogate = (1. - leak) * tanh_x + leak * x
-    return surrogate + (tanh_x - surrogate).detach()
+    return straight_through(surrogate, tanh_x)
 
 class LeakyTanh(Module):
     def __init__(
@@ -416,21 +419,28 @@ class Beta(Module):
         elif self.pos_fn == 'softplus':
             return F.softplus(raw_conc + self.raw_init_conc) + self.min_conc
 
-    # unimodal floors - detached by default so gradients still flow back to the raw params
+    # straight through the unimodal correction, detached by default so gradients still flow back to the raw params
 
-    def maybe_detach(self, x: Tensor) -> Tensor:
-        return x.detach() if self.detach_unimodal else x
+    def maybe_straight_through(self, x: Tensor, y: Tensor) -> Tensor:
+        return straight_through(x, y) if self.detach_unimodal else y
 
-    def floor_total_concentration(self, unit_mean: Tensor, conc: Tensor) -> Tensor:
-        # floor the total concentration at 1 / min(unit mean, 1 - unit mean) so the beta is unimodal,
-        # which preserves the mean
+    def unimodal_concentrations(self, unit_mean: Tensor, conc: Tensor) -> tuple[Tensor, Tensor]:
+        # raise the total concentration to preserve the mean, up to the damping floor
 
         floor = 1. / torch.minimum(unit_mean, 1. - unit_mean)
 
         if exists(self.max_unimodal_floor):
             floor = floor.clamp(max = self.max_unimodal_floor)
 
-        return conc + self.maybe_detach(floor)
+        conc = self.maybe_straight_through(conc, conc + floor)
+
+        # nudge the mean just enough to keep both concentrations at or above one, which preserves the total
+
+        bound = 1. / conc.clamp(min = 2.)
+        clamped = unit_mean.clamp(min = bound, max = 1. - bound)
+        unit_mean = self.maybe_straight_through(unit_mean, clamped)
+
+        return unit_mean, conc
 
     # straight through the eps clamp, so a saturated mean keeps its gradient
 
@@ -438,8 +448,7 @@ class Beta(Module):
         scale = as_tensor(self.scale, device = unit_mean.device, dtype = unit_mean.dtype)
         eps = self.eps / scale
 
-        clamped = unit_mean.clamp(min = eps, max = 1. - eps)
-        return unit_mean + (clamped - unit_mean).detach()
+        return straight_through(unit_mean, unit_mean.clamp(min = eps, max = 1. - eps))
 
     def unit_mean(
         self,
@@ -452,7 +461,7 @@ class Beta(Module):
         return self.clamp_unit_mean((self.squash_fn(raw_mean) + 1.) / 2.)
 
     # raw params to the unit mean and total concentration, one pathway per parameterization,
-    # with the unimodal floor applied, which preserves the mean
+    # with the unimodal adjustment applied
 
     def concentrations(
         self,
@@ -470,7 +479,7 @@ class Beta(Module):
             conc = self.concentration(params[..., 1], indexed = True) / temperature
 
         if self.unimodal:
-            conc = self.floor_total_concentration(unit_mean, conc)
+            unit_mean, conc = self.unimodal_concentrations(unit_mean, conc)
 
         return unit_mean, conc
 

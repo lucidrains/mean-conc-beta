@@ -111,7 +111,8 @@ def test_unimodality(pos_fn, val_range):
     assert (unbounded.concentration0 > 1.).all()
 
     damped = Beta(pos_fn = pos_fn, val_range = val_range)(params).base_dist
-    assert (torch.maximum(damped.concentration1, damped.concentration0) > 1.).all()
+    assert (damped.concentration1 >= 1.).all()
+    assert (damped.concentration0 >= 1.).all()
 
 # detaching the unimodal floor keeps boundary gradients bounded
 
@@ -534,7 +535,8 @@ def test_alpha_beta_unimodality(pos_fn):
     assert (unbounded.concentration0 > 1.).all()
 
     damped = Beta(pos_fn = pos_fn, param_with_alpha_beta = True)(params).base_dist
-    assert (torch.maximum(damped.concentration1, damped.concentration0) > 1.).all()
+    assert (damped.concentration1 >= 1.).all()
+    assert (damped.concentration0 >= 1.).all()
 
 # detaching the entropy mean also works for the alpha / beta parameterization -
 # gradients flow only through the total concentration, in proportion to alpha and beta
