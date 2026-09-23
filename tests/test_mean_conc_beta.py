@@ -243,7 +243,7 @@ def test_temperature_zero():
 
 @param('bounds', [(-1., 1.), (0., 1.)])
 def test_non_unimodal_mode(bounds):
-    beta = Beta(bounds = bounds, unimodal = False)
+    beta = Beta(bounds = bounds, unimodal = False, pos_fn = 'exp')
     low, high = bounds
 
     # (unit mean, concentration) -> alpha = unit mean * conc, beta = (1 - unit mean) * conc
@@ -289,13 +289,13 @@ def test_arbitrary_range():
 # raw concentration is clamped to keep init_conc exact and extremes stable
 
 def test_concentration_clamp():
-    beta = Beta(init_conc = 10.)
+    beta = Beta(init_conc = 10., pos_fn = 'exp')
     assert beta.clamp_exp == (-4., 4.)
 
     assert math.isclose(beta.concentration(tensor([0., 0.])).item(), 10., rel_tol = 1e-5)
     assert math.isclose(beta.concentration(tensor([0., 100.])).item(), 10. * math.exp(4.), rel_tol = 1e-4)
     assert math.isclose(beta.concentration(tensor([0., -100.])).item(), 10. * math.exp(-4.), rel_tol = 1e-4)
-    assert math.isclose(Beta(init_conc = 1e6).concentration(tensor([0., 0.])).item(), 1e6, rel_tol = 1e-5)
+    assert math.isclose(Beta(init_conc = 1e6, pos_fn = 'exp').concentration(tensor([0., 0.])).item(), 1e6, rel_tol = 1e-5)
     assert math.isclose(Beta(pos_fn = 'softplus', init_conc = 1e6).concentration(tensor([0., 0.])).item(), 1e6, rel_tol = 1e-4)
 
     assert Beta(clamp_exp = 5.).clamp_exp == (-5., 5.)
@@ -506,7 +506,7 @@ def test_alpha_beta_parameterization(pos_fn, val_range):
     assert torch.isfinite(params.grad).all()
 
 def test_alpha_beta_concentration_config():
-    beta = Beta(param_with_alpha_beta = True, min_conc = 1., clamp_exp = 2.)
+    beta = Beta(param_with_alpha_beta = True, min_conc = 1., clamp_exp = 2., pos_fn = 'exp')
 
     # init_conc and min_conc set the raw offset, clamp_exp bounds the raw concentrations
 
@@ -544,7 +544,7 @@ def test_alpha_beta_unimodality(pos_fn):
 def test_alpha_beta_detach_entropy_mean():
     params = tensor([[math.log(0.3), math.log(0.6)]], requires_grad = True)
 
-    beta = Beta(param_with_alpha_beta = True, unimodal = False)
+    beta = Beta(param_with_alpha_beta = True, unimodal = False, pos_fn = 'exp')
     alpha = beta.concentration(params[..., 0], indexed = True)
     beta_conc = beta.concentration(params[..., 1], indexed = True)
 
@@ -552,13 +552,13 @@ def test_alpha_beta_detach_entropy_mean():
     detached_grad = params.grad.clone()
 
     params.grad = None
-    Beta(param_with_alpha_beta = True, unimodal = False, detach_entropy_mean = False)(params).entropy().backward()
+    Beta(param_with_alpha_beta = True, unimodal = False, detach_entropy_mean = False, pos_fn = 'exp')(params).entropy().backward()
 
     assert torch.allclose(detached_grad[0, 0] / alpha, detached_grad[0, 1] / beta_conc)
     assert not torch.allclose(params.grad[0, 0] / alpha, params.grad[0, 1] / beta_conc)
 
 def test_alpha_beta_mode_and_kl():
-    beta = Beta(param_with_alpha_beta = True, unimodal = False)
+    beta = Beta(param_with_alpha_beta = True, unimodal = False, pos_fn = 'exp')
 
     # raw params log(0.3) and log(0.6) give alpha = 3 and beta = 6 at init_conc = 10
     # mode = (alpha - 1) / (alpha + beta - 2) = 2/7 on (-1., 1.)

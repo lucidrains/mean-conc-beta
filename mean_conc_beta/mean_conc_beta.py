@@ -261,7 +261,7 @@ class Beta(Module):
     def __init__(
         self,
         bounds = None,
-        pos_fn = 'exp',
+        pos_fn = 'softplus',
         init_conc = 10.,
         min_conc = 0.,
         eps = 1e-5,
