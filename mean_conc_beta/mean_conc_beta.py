@@ -8,6 +8,7 @@ import torch
 from torch import Tensor, Size, is_tensor, as_tensor
 import torch.nn.functional as F
 from torch.nn import Module
+from torch.autograd import Function
 from torch.distributions import (
     Distribution,
     Beta as _Beta,
@@ -216,14 +217,33 @@ class TransformedBeta(TransformedDistribution):
         log_scale = as_tensor(self.transform.scale).abs().log()
         return self.entropy_base_dist.entropy() + log_scale
 
-# leaky tanh - exact tanh forward, straight through backward with the gradient floored at `leak`,
-# so a mean saturated at a bound can still be pulled back
+# directed leaky tanh - exact tanh forward, straight through backward with the leak
+# applied only when escaping saturation (moving inward towards 0), preserving tanh's natural
+# vanishing derivative when pushing further into saturation
+
+class DirectedLeakyTanh(Function):
+    @staticmethod
+    def forward(ctx, x: Tensor, leak: float = 0.1) -> Tensor:
+        ctx.leak = leak
+        out = x.tanh()
+        ctx.save_for_backward(out)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        out, = ctx.saved_tensors
+        sech2 = 1. - out.pow(2)
+
+        # leak is only applied when the gradient step pulls x back towards 0 (escaping saturation)
+        escaping = (grad_output * out) > 0.
+        leak_grad = (1. - ctx.leak) * sech2 + ctx.leak
+        grad = torch.where(escaping, leak_grad, sech2)
+
+        return grad_output * grad, None
 
 def leaky_tanh(x: Tensor, leak: float = 0.1) -> Tensor:
     assert 0. <= leak <= 1., f'leak factor must be between 0 and 1, got {leak}'
-    tanh_x = x.tanh()
-    surrogate = (1. - leak) * tanh_x + leak * x
-    return straight_through(surrogate, tanh_x)
+    return DirectedLeakyTanh.apply(x, leak)
 
 class LeakyTanh(Module):
     def __init__(
@@ -266,7 +286,7 @@ class Beta(Module):
         min_conc = 0.,
         eps = 1e-5,
         unimodal: bool | float = True,
-        max_unimodal_floor: float | None = 20.,
+        max_unimodal_floor: float | None = 50.,
         detach_unimodal = True,
         detach_entropy_mean = True,
         clamp_exp = (-4., 4.),
@@ -434,7 +454,7 @@ class Beta(Module):
 
         conc = self.maybe_straight_through(conc, conc + floor)
 
-        # nudge the mean just enough to keep both concentrations at or above one, which preserves the total
+        # nudge the mean just enough to keep both concentrations above one while preserving the total
 
         bound = 1. / conc.clamp(min = 2.)
         clamped = unit_mean.clamp(min = bound, max = 1. - bound)
