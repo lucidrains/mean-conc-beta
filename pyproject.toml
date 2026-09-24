@@ -1,6 +1,6 @@
 [project]
 name = "mean-conc-beta"
-version = "0.2.1"
+version = "0.2.2"
 description = "Beta distribution with mean / concentration parameterization, for bounded continuous action spaces in RL"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -36,9 +36,11 @@ Repository = "https://github.com/lucidrains/mean-conc-beta"
 [project.optional-dependencies]
 test = [
     "gymnasium[mujoco]",
+    "memmap-replay-buffer",
     "numpy",
     "pytest",
-    "tqdm"
+    "tqdm",
+    "x-ppo"
 ]
 
 [tool.pytest.ini_options]

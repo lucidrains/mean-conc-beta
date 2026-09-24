@@ -15,7 +15,7 @@ from mean_conc_beta.mean_conc_beta import clamp
 
 # e2e - forward, sample, rsample, log prob, entropy, mode, backward
 
-@param('pos_fn', ['exp', 'softplus'])
+@param('pos_fn', ['exp', 'softplus', 'elu'])
 @param('val_range', [(-1., 1.), (0., 1.)])
 def test_end_to_end(pos_fn, val_range):
     beta = Beta(pos_fn = pos_fn, val_range = val_range)
@@ -101,7 +101,7 @@ def test_leaky_tanh():
 
 # unbounded floor forces alpha, beta > 1, default damping avoids U shapes
 
-@param('pos_fn', ['exp', 'softplus'])
+@param('pos_fn', ['exp', 'softplus', 'elu'])
 @param('val_range', [(-1., 1.), (0., 1.)])
 def test_unimodality(pos_fn, val_range):
     params = tensor([[[-100., 0.], [100., 0.]], [[0., -10.], [0., 10.]]])
@@ -305,10 +305,27 @@ def test_concentration_clamp():
     with raises(AssertionError):
         Beta(min_conc = -1.)
 
+# elu(x) + 1 as a positive function, with an identity preclamp
+
+def test_elu_pos_fn():
+    beta = Beta(pos_fn = 'elu', init_conc = 10.)
+    assert math.isclose(beta.concentration(tensor([0.]), indexed = True).item(), 10., rel_tol = 1e-5)
+
+    # the inverse switches to log below one
+
+    assert math.isclose(Beta(pos_fn = 'elu', init_conc = 1.).concentration(tensor([0.]), indexed = True).item(), 1., rel_tol = 1e-5)
+    assert math.isclose(Beta(pos_fn = 'elu', init_conc = 0.5).concentration(tensor([0.]), indexed = True).item(), 0.5, rel_tol = 1e-5)
+
+    # clamp_exp does not apply
+
+    beta = Beta(pos_fn = 'elu', init_conc = 10., clamp_exp = 2.)
+    assert math.isclose(beta.concentration(tensor([4.]), indexed = True).item(), 14., rel_tol = 1e-4)
+    assert math.isclose(beta.concentration(tensor([-5.]), indexed = True).item(), 5., rel_tol = 1e-4)
+
 # unimodal can be turned off, and the float shorthand sets the floor
 
 def test_unimodal_flag():
-    assert Beta().unimodal and Beta().max_unimodal_floor == 20.
+    assert Beta().unimodal and Beta().max_unimodal_floor == 50.
     assert not Beta(unimodal = False).unimodal
     assert not Beta(unimodal = 0).unimodal
     assert Beta(unimodal = False).max_unimodal_floor is None
@@ -457,7 +474,7 @@ def test_sample_shape_int():
 
 # regular alpha / beta parameterization - raw params map directly to the two concentrations
 
-@param('pos_fn', ['exp', 'softplus'])
+@param('pos_fn', ['exp', 'softplus', 'elu'])
 @param('val_range', [(-1., 1.), (0., 1.)])
 def test_alpha_beta_parameterization(pos_fn, val_range):
     beta = Beta(pos_fn = pos_fn, val_range = val_range, param_with_alpha_beta = True, unimodal = False)
@@ -526,7 +543,7 @@ def test_alpha_beta_matches_native_beta():
 
 # the unimodal floor applies to the alpha / beta parameterization as well
 
-@param('pos_fn', ['exp', 'softplus'])
+@param('pos_fn', ['exp', 'softplus', 'elu'])
 def test_alpha_beta_unimodality(pos_fn):
     params = tensor([[[-100., 0.], [0., -100.], [100., 0.], [0., 100.]]])
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import math
+from collections import namedtuple
 from functools import wraps
 
 from numpy import ndarray
@@ -25,13 +26,11 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def identity(t, *args, **kwargs):
+    return t
+
 def straight_through(x: Tensor, y: Tensor) -> Tensor:
     return x + (y - x).detach()
-
-def inv_softplus(y: float) -> float:
-    # exact inverse of softplus, switching to the asymptotic form for large y where expm1 overflows
-
-    return math.log(math.expm1(y)) if y < 20. else y + math.log(-math.expm1(-y))
 
 def parse_sample_shape(sample_shape) -> Size:
     return Size((sample_shape,) if isinstance(sample_shape, int) else sample_shape)
@@ -43,9 +42,8 @@ def clamp(x, low, high):
     if not any(map(is_tensor, (x, low, high))):
         return min(max(x, low), high)
 
-    device = next((t.device for t in (x, low, high) if is_tensor(t)), None)
-    dtype = next((t.dtype for t in (x, low, high) if is_tensor(t)), None)
-    x, low, high = [as_tensor(t, device = device, dtype = dtype) for t in (x, low, high)]
+    t = next(t for t in (x, low, high) if is_tensor(t))
+    x, low, high = (as_tensor(v, device = t.device, dtype = t.dtype) for v in (x, low, high))
 
     return x.clamp(min = low, max = high)
 
@@ -246,10 +244,7 @@ def leaky_tanh(x: Tensor, leak: float = 0.1) -> Tensor:
     return DirectedLeakyTanh.apply(x, leak)
 
 class LeakyTanh(Module):
-    def __init__(
-        self,
-        leak = 0.1
-    ):
+    def __init__(self, leak = 0.1):
         super().__init__()
         assert 0. <= leak <= 1., f'leak factor must be between 0 and 1, got {leak}'
         self.leak = leak
@@ -264,6 +259,33 @@ SQUASH_FNS = dict(
     softsign = F.softsign,
     algebraic = lambda x: x / (1. + x ** 2).sqrt(),
     leaky_tanh = LeakyTanh()
+)
+
+# positive functions for the concentration, each with its inverse for the raw offset
+# that lands zero on init_conc, and a preclamp on the raw value (identity for softplus and elu)
+
+PosFn = namedtuple('PosFn', ['fn', 'inv', 'preclamp'])
+
+def inv_softplus(y: float) -> float:
+    # exact inverse of softplus, switching to the asymptotic form for large y where expm1 overflows
+
+    return math.log(math.expm1(y)) if y < 20. else y + math.log(-math.expm1(-y))
+
+def elu_plus_one(x: Tensor) -> Tensor:
+    return F.elu(x) + 1.
+
+def inv_elu_plus_one(y: float) -> float:
+    # exact inverse of elu(x) + 1
+
+    return y - 1. if y >= 1. else math.log(y)
+
+def preclamp_exp(x: Tensor, clamp_exp = None) -> Tensor:
+    return x.clamp(*clamp_exp) if exists(clamp_exp) else x
+
+POS_FNS = dict(
+    exp = PosFn(torch.exp, math.log, preclamp_exp),
+    softplus = PosFn(F.softplus, inv_softplus, identity),
+    elu = PosFn(elu_plus_one, inv_elu_plus_one, identity)
 )
 
 # unit mean and concentration to the two beta concentrations
@@ -307,7 +329,7 @@ class Beta(Module):
             else:
                 pos_fn, bounds = bounds, pos_fn
 
-        assert pos_fn in ('exp', 'softplus'), f'pos_fn must be either exp or softplus, got {pos_fn}'
+        assert pos_fn in POS_FNS, f'pos_fn must be one of {tuple(POS_FNS.keys())}, got {pos_fn}'
         assert min_conc >= 0., f'min_conc must be non-negative, got {min_conc}'
         assert init_conc > min_conc, f'init_conc ({init_conc}) must be greater than min_conc ({min_conc})'
 
@@ -330,19 +352,16 @@ class Beta(Module):
         # a float shorthand for unimodal sets the damping floor
 
         if not isinstance(unimodal, bool) and isinstance(unimodal, (int, float)):
-            if unimodal <= 0:
-                unimodal, max_unimodal_floor = False, None
-            else:
-                unimodal, max_unimodal_floor = True, float(unimodal)
+            unimodal, max_unimodal_floor = (True, float(unimodal)) if unimodal > 0 else (False, None)
 
         self.unimodal = unimodal
         self.max_unimodal_floor = max_unimodal_floor if unimodal else None
         self.detach_unimodal = detach_unimodal
         self.detach_entropy_mean = detach_entropy_mean
 
-        if exists(clamp_log_conc):
-            clamp_exp = (-float(clamp_log_conc), float(clamp_log_conc))
-        elif isinstance(clamp_exp, (int, float)):
+        clamp_exp = default(clamp_log_conc, clamp_exp)
+
+        if isinstance(clamp_exp, (int, float)):
             clamp_exp = (-float(clamp_exp), float(clamp_exp))
 
         self.clamp_exp = clamp_exp
@@ -358,7 +377,7 @@ class Beta(Module):
         # raw offset so concentration at raw_conc = 0 is exactly init_conc
 
         delta_conc = init_conc - min_conc
-        self.raw_init_conc = math.log(delta_conc) if pos_fn == 'exp' else inv_softplus(delta_conc)
+        self.raw_init_conc = POS_FNS[pos_fn].inv(delta_conc)
 
     @property
     def range(self):
@@ -386,11 +405,11 @@ class Beta(Module):
             target_range = parse_bounds(target_range)
 
         if clip is True:
-            clip = target_range if exists(target_range) else self.bounds
-        elif clip is False:
-            clip = None
-        elif exists(clip):
+            clip = default(target_range, self.bounds)
+        elif exists(clip) and clip is not False:
             clip = parse_bounds(clip)
+        else:
+            clip = None
 
         if not exists(target_range) and not exists(clip):
             return step_fn
@@ -415,7 +434,10 @@ class Beta(Module):
         temperature: float = 1.,
         detach_entropy_mean: bool | None = None
     ) -> Distribution:
-        return params_or_dist if isinstance(params_or_dist, Distribution) else self(params_or_dist, temperature = temperature, detach_entropy_mean = detach_entropy_mean)
+        if isinstance(params_or_dist, Distribution):
+            return params_or_dist
+
+        return self(params_or_dist, temperature = temperature, detach_entropy_mean = detach_entropy_mean)
 
     def concentration(
         self,
@@ -429,15 +451,10 @@ class Beta(Module):
 
         raw_conc = params if indexed else params[..., 1]
 
-        if self.pos_fn == 'exp':
-            if exists(self.clamp_exp):
-                min_val, max_val = self.clamp_exp
-                raw_conc = raw_conc.clamp(min = min_val, max = max_val)
+        pos_fn = POS_FNS[self.pos_fn]
+        raw_conc = pos_fn.preclamp(raw_conc, self.clamp_exp)
 
-            return (raw_conc + self.raw_init_conc).exp() + self.min_conc
-
-        elif self.pos_fn == 'softplus':
-            return F.softplus(raw_conc + self.raw_init_conc) + self.min_conc
+        return pos_fn.fn(raw_conc + self.raw_init_conc) + self.min_conc
 
     # straight through the unimodal correction, detached by default so gradients still flow back to the raw params
 
@@ -454,9 +471,10 @@ class Beta(Module):
 
         conc = self.maybe_straight_through(conc, conc + floor)
 
-        # nudge the mean just enough to keep both concentrations above one while preserving the total
+        # nudge the mean just enough to keep both concentrations above one while preserving the total,
+        # with a relative eps lifting the bound past the float rounding of bound * conc
 
-        bound = 1. / conc.clamp(min = 2.)
+        bound = ((1. + self.eps) / conc.clamp(min = 2.)).clamp(max = 0.5)
         clamped = unit_mean.clamp(min = bound, max = 1. - bound)
         unit_mean = self.maybe_straight_through(unit_mean, clamped)
 
@@ -516,9 +534,7 @@ class Beta(Module):
         else:
             unit_mean, _ = self.concentrations(params_or_dist)
 
-        loc = as_tensor(self.loc, device = params_or_dist.device, dtype = params_or_dist.dtype)
-        scale = as_tensor(self.scale, device = params_or_dist.device, dtype = params_or_dist.dtype)
-
+        loc, scale = (as_tensor(t, device = params_or_dist.device, dtype = params_or_dist.dtype) for t in (self.loc, self.scale))
         return loc + unit_mean * scale
 
     def mode(
@@ -603,9 +619,7 @@ class Beta(Module):
 
         detach_entropy_mean = default(detach_entropy_mean, self.detach_entropy_mean)
 
-        loc = as_tensor(self.loc, device = params.device, dtype = params.dtype)
-        scale = as_tensor(self.scale, device = params.device, dtype = params.dtype)
-
+        loc, scale = (as_tensor(t, device = params.device, dtype = params.dtype) for t in (self.loc, self.scale))
         transform = AffineTransform(loc = loc, scale = scale)
 
         # deterministic greedy action when temperature is 0
@@ -620,9 +634,6 @@ class Beta(Module):
 
         # detach mean so entropy only regularizes concentration without penalizing non-zero mean actions
 
-        entropy_base_dist = None
-
-        if detach_entropy_mean:
-            entropy_base_dist = to_beta(unit_mean.detach(), conc)
+        entropy_base_dist = to_beta(unit_mean.detach(), conc) if detach_entropy_mean else None
 
         return TransformedBeta(base_dist, transform, entropy_base_dist = entropy_base_dist, eps = self.eps)

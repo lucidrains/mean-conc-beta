@@ -4,6 +4,7 @@
 #     "numpy",
 #     "rich",
 #     "torch>=2.5",
+#     "x-ppo",
 # ]
 # ///
 
@@ -28,6 +29,7 @@ from mean_conc_beta import Beta
 
 def train(
     seed,
+    pos_fn = 'softplus',
     squash_fn = 'leaky_tanh',
     param_with_alpha_beta = False,
     unimodal = True,
@@ -48,6 +50,7 @@ def train(
 
     distr = Beta(
         init_conc = 2.,
+        pos_fn = pos_fn,
         squash_fn = squash_fn,
         param_with_alpha_beta = param_with_alpha_beta,
         unimodal = unimodal,
@@ -85,6 +88,7 @@ def train(
 # main
 
 def main(
+    pos_fn: str = 'softplus',
     seeds: int = 10,
     iterations: int = 300,
     batch_size: int = 512,
@@ -96,7 +100,7 @@ def main(
 
     console.print()
     console.print(Panel.fit(
-        "[bold]Escape Bandit[/bold]\n\n"
+        f"[bold]Escape Bandit (pos_fn = {pos_fn})[/bold]\n\n"
         "A policy is trained to sit at the [cyan]+1.0[/cyan] bound until saturated.\n"
         "Halfway through, the target abruptly flips to the opposite bound ([cyan]-1.0[/cyan]).\n\n"
         "• [yellow]tanh[/yellow]: vanishing gradients (sech² ≈ 0) at the boundary leave the policy trapped.\n"
@@ -117,6 +121,7 @@ def main(
         name: [
             train(
                 seed,
+                pos_fn = pos_fn,
                 iterations = iterations,
                 batch_size = batch_size,
                 lr = lr,

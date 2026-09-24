@@ -1,4 +1,16 @@
+# /// script
+# dependencies = [
+#     "fire",
+#     "gymnasium[mujoco]",
+#     "memmap-replay-buffer",
+#     "numpy",
+#     "torch>=2.5",
+#     "x-ppo",
+# ]
+# ///
+
 from __future__ import annotations
+import tempfile
 import numpy as np
 
 import torch
@@ -6,6 +18,10 @@ from torch import nn
 from torch.optim import AdamW
 
 import gymnasium as gym
+import fire
+
+from memmap_replay_buffer import ReplayBuffer
+from x_ppo import calc_gae, dones_to_masks, ppo_actor_loss
 
 from mean_conc_beta import Beta
 
@@ -15,6 +31,7 @@ class Actor(nn.Module):
     def __init__(
         self,
         bounds = (-1., 1.),
+        pos_fn = 'softplus',
         dim_state = 4,
         dim_action = 1,
         dim_hidden = 64
@@ -25,7 +42,7 @@ class Actor(nn.Module):
             nn.Tanh(),
             nn.Linear(dim_hidden, dim_action * 2)
         )
-        self.distr = Beta(bounds = bounds)
+        self.distr = Beta(bounds = bounds, pos_fn = pos_fn)
 
     def forward(self, x):
         params = self.net(x).view(*x.shape[:-1], -1, 2)
@@ -73,27 +90,58 @@ def evaluate(actor, env, num_episodes = 5):
 
 # ppo training sanity check
 
-def train_inverted_pendulum():
-    torch.manual_seed(42)
-    np.random.seed(42)
+def train_inverted_pendulum(
+    pos_fn: str = 'softplus',
+    num_envs: int = 8,
+    rollout_len: int = 256,
+    batch_size: int = 64,
+    epochs: int = 4,
+    max_iterations: int = 20,
+    lr: float = 3e-4,
+    entropy_coef: float = 0.005,
+    seed: int = 42
+):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
-    env = gym.make_vec('InvertedPendulum-v5', num_envs = 8)
+    env = gym.make_vec('InvertedPendulum-v5', num_envs = num_envs)
     eval_env = gym.make('InvertedPendulum-v5')
 
     bounds = (float(env.single_action_space.low[0]), float(env.single_action_space.high[0]))
 
-    actor = Actor(bounds = bounds)
+    actor = Actor(bounds = bounds, pos_fn = pos_fn)
     critic = Critic()
-    optimizer = AdamW([*actor.parameters(), *critic.parameters()], lr = 3e-4)
+    optimizer = AdamW([*actor.parameters(), *critic.parameters()], lr = lr)
 
-    obs, _ = env.reset(seed = 42)
-    max_iterations = 20
+    temp_dir = tempfile.TemporaryDirectory()
+    buffer = ReplayBuffer(
+        temp_dir.name,
+        max_episodes = num_envs,
+        max_timesteps = rollout_len,
+        fields = dict(
+            obs = ('float', 4),
+            action = ('float', 1),
+            log_prob = 'float',
+            advantage = 'float',
+            returns = 'float'
+        ),
+        circular = True,
+        overwrite = True
+    )
+
+    obs, _ = env.reset(seed = seed)
     score = 0.
 
-    for iteration in range(max_iterations):
-        obs_buf, action_buf, log_prob_buf, val_buf, reward_buf, done_buf = [], [], [], [], [], []
+    obs_seq = torch.zeros(rollout_len, num_envs, 4)
+    action_seq = torch.zeros(rollout_len, num_envs, 1)
+    log_prob_seq = torch.zeros(rollout_len, num_envs)
+    val_seq = torch.zeros(rollout_len, num_envs)
+    reward_seq = torch.zeros(rollout_len, num_envs)
+    term_seq = torch.zeros(rollout_len, num_envs, dtype = torch.bool)
+    trunc_seq = torch.zeros(rollout_len, num_envs, dtype = torch.bool)
 
-        for _ in range(256):
+    for iteration in range(max_iterations):
+        for step in range(rollout_len):
             obs_tensor = torch.from_numpy(obs).float()
 
             with torch.no_grad():
@@ -102,60 +150,57 @@ def train_inverted_pendulum():
                 log_prob = dist.log_prob(action).sum(dim = -1)
                 value = critic(obs_tensor)
 
-            obs_buf.append(obs)
-            action_buf.append(action.numpy())
-            log_prob_buf.append(log_prob.numpy())
-            val_buf.append(value.numpy())
-
             next_obs, rewards, terms, truncs, _ = env.step(action.numpy())
 
-            reward_buf.append(rewards)
-            done_buf.append(terms | truncs)
+            obs_seq[step] = obs_tensor
+            action_seq[step] = action
+            log_prob_seq[step] = log_prob
+            val_seq[step] = value
+            reward_seq[step] = torch.from_numpy(rewards)
+            term_seq[step] = torch.from_numpy(terms)
+            trunc_seq[step] = torch.from_numpy(truncs)
 
             obs = next_obs
 
         # generalized advantage estimation (gae)
 
         with torch.no_grad():
-            last_value = critic(torch.from_numpy(obs).float()).numpy()
+            last_value = critic(torch.from_numpy(obs).float())
 
-        all_values = [*val_buf, last_value]
-        advantages = np.zeros((256, 8), dtype = np.float32)
-        last_gae = np.zeros(8, dtype = np.float32)
+        rewards = reward_seq.T
+        values = val_seq.T
+        terms = term_seq.T
+        truncs = trunc_seq.T
 
-        for t in reversed(range(256)):
-            non_terminal = 1. - done_buf[t].astype(np.float32)
-            delta = reward_buf[t] + 0.99 * all_values[t + 1] * non_terminal - all_values[t]
-            last_gae = delta + 0.99 * 0.95 * non_terminal * last_gae
-            advantages[t] = last_gae
+        term_mask, done_mask = dones_to_masks(terms, truncs)
+        returns, advantages = calc_gae(rewards, values, masks = term_mask, done_masks = done_mask, next_value = last_value, return_advantages = True)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        returns = advantages + np.array(val_buf)
+        buffer.clear()
+        for env_idx in range(num_envs):
+            buffer.store_episode(
+                obs = obs_seq[:, env_idx],
+                action = action_seq[:, env_idx],
+                log_prob = log_prob_seq[:, env_idx],
+                advantage = advantages[env_idx],
+                returns = returns[env_idx]
+            )
 
-        # batch update
+        # batch update with replay buffer dataloader
 
-        flat_obs = torch.from_numpy(np.array(obs_buf).reshape(-1, 4)).float()
-        flat_actions = torch.from_numpy(np.array(action_buf).reshape(-1, 1)).float()
-        flat_log_probs = torch.from_numpy(np.array(log_prob_buf).reshape(-1)).float()
-        flat_advantages = torch.from_numpy(advantages.reshape(-1)).float()
-        flat_returns = torch.from_numpy(returns.reshape(-1)).float()
+        for _ in range(epochs):
+            dataloader = buffer.dataloader(
+                batch_size = batch_size,
+                timestep_level = True,
+                to_named_tuple = ('obs', 'action', 'log_prob', 'advantage', 'returns')
+            )
 
-        flat_advantages = (flat_advantages - flat_advantages.mean()) / (flat_advantages.std() + 1e-8)
+            for batch in dataloader:
+                dist = actor(batch.obs)
+                new_log_probs = dist.log_prob(batch.action).sum(dim = -1)
 
-        for _ in range(4):
-            perm = torch.randperm(flat_obs.shape[0])
-
-            for start in range(0, flat_obs.shape[0], 64):
-                idx = perm[start:start + 64]
-
-                dist = actor(flat_obs[idx])
-                new_log_probs = dist.log_prob(flat_actions[idx]).sum(dim = -1)
-
-                ratio = (new_log_probs - flat_log_probs[idx]).exp()
-                surr1 = ratio * flat_advantages[idx]
-                surr2 = ratio.clamp(0.8, 1.2) * flat_advantages[idx]
-
-                policy_loss = -torch.min(surr1, surr2).mean() - 0.005 * dist.entropy().sum(dim = -1).mean()
-                value_loss = 0.5 * ((critic(flat_obs[idx]) - flat_returns[idx]) ** 2).mean()
+                policy_loss = ppo_actor_loss(new_log_probs, batch.log_prob, batch.advantage).mean() - entropy_coef * dist.entropy().sum(dim = -1).mean()
+                value_loss = 0.5 * ((critic(batch.obs) - batch.returns) ** 2).mean()
 
                 loss = policy_loss + value_loss
 
@@ -170,9 +215,11 @@ def train_inverted_pendulum():
 
     env.close()
     eval_env.close()
+    temp_dir.cleanup()
 
     assert score >= 100., f'expected inverted pendulum to balance, final eval: {score}'
+    print(f'inverted pendulum sanity check passed with {pos_fn} (score: {score:.1f})')
+    return score
 
 if __name__ == '__main__':
-    train_inverted_pendulum()
-    print('inverted pendulum sanity check passed!')
+    fire.Fire(train_inverted_pendulum)
