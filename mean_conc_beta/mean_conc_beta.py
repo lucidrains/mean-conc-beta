@@ -296,6 +296,11 @@ def to_concentrations(unit_mean: Tensor, conc: Tensor) -> tuple[Tensor, Tensor]:
 def to_beta(unit_mean: Tensor, conc: Tensor) -> _Beta:
     return _Beta(*to_concentrations(unit_mean, conc))
 
+# transformed parameters, the unit mean and total concentration, which can be passed onwards
+# to sampling, entropy, log prob, or as inputs to a critic
+
+TransformedParams = namedtuple('TransformedParams', ['unit_mean', 'concentration'])
+
 # beta distribution policy on (-1, 1) or (0, 1), an affine shift of a unit-interval beta,
 # parameterized by a mean and concentration, or the two concentrations directly
 
@@ -501,11 +506,11 @@ class Beta(Module):
     # raw params to the unit mean and total concentration, one pathway per parameterization,
     # with the unimodal adjustment applied
 
-    def concentrations(
+    def to_transformed(
         self,
         params: Tensor,
         temperature: float = 1.
-    ) -> tuple[Tensor, Tensor]:
+    ) -> TransformedParams:
         if self.param_with_alpha_beta:
             alpha = self.concentration(params[..., 0], indexed = True)
             beta = self.concentration(params[..., 1], indexed = True)
@@ -519,7 +524,44 @@ class Beta(Module):
         if self.unimodal:
             unit_mean, conc = self.unimodal_concentrations(unit_mean, conc)
 
-        return unit_mean, conc
+        return TransformedParams(unit_mean, conc)
+
+    def concentrations(
+        self,
+        params: Tensor,
+        temperature: float = 1.
+    ) -> tuple[Tensor, Tensor]:
+        transformed = self.to_transformed(params, temperature)
+        return transformed.unit_mean, transformed.concentration
+
+    def from_transformed(
+        self,
+        transformed: TransformedParams | tuple[Tensor, Tensor],
+        apply_unimodal = False
+    ) -> Distribution:
+        unit_mean, conc = transformed
+        unit_mean, conc = as_tensor(unit_mean), as_tensor(conc)
+
+        if apply_unimodal and self.unimodal:
+            unit_mean, conc = self.unimodal_concentrations(unit_mean, conc)
+
+        loc, scale = (as_tensor(t, device = unit_mean.device, dtype = unit_mean.dtype) for t in (self.loc, self.scale))
+        transform = AffineTransform(loc = loc, scale = scale)
+
+        base_dist = to_beta(unit_mean, conc)
+        return TransformedBeta(base_dist, transform, eps = self.eps)
+
+    def deterministic_transformed(
+        self,
+        action: Tensor,
+        concentration: float = 1e3
+    ) -> TransformedParams:
+        loc, scale = (as_tensor(t, device = action.device, dtype = action.dtype) for t in (self.loc, self.scale))
+
+        unit_mean = ((action - loc) / scale).clamp(min = self.eps, max = 1. - self.eps)
+        conc = torch.full_like(unit_mean, concentration)
+
+        return TransformedParams(unit_mean, conc)
 
     def mean(
         self,

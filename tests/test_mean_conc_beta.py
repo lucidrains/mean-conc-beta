@@ -585,3 +585,51 @@ def test_alpha_beta_mode_and_kl():
 
     assert torch.allclose(beta.mode(params), tensor([[expected_mode]]), atol = 1e-4)
     assert torch.allclose(beta.kl_divergence(params, params), torch.zeros(1), atol = 1e-5)
+
+# raw params to transformed params, then onwards to sampling and other downstream operations
+
+@param('pos_fn', ['exp', 'softplus', 'elu'])
+@param('param_with_alpha_beta', [False, True])
+def test_to_from_transformed(pos_fn, param_with_alpha_beta):
+    beta = Beta(pos_fn = pos_fn, param_with_alpha_beta = param_with_alpha_beta)
+    params = torch.randn(16, 2)
+
+    unit_mean, conc = beta.concentrations(params)
+    transformed = beta.to_transformed(params)
+
+    assert torch.allclose(transformed.unit_mean, unit_mean)
+    assert torch.allclose(transformed.concentration, conc)
+
+    raw_dist = beta(params)
+    transformed_dist = beta.from_transformed(transformed)
+
+    assert torch.allclose(raw_dist.mean, transformed_dist.mean, atol = 1e-5)
+    assert torch.allclose(raw_dist.variance, transformed_dist.variance, atol = 1e-5)
+
+    actions = transformed_dist.sample()
+    assert actions.shape == (16,)
+    assert transformed_dist.log_prob(actions).shape == (16,)
+    assert transformed_dist.entropy().shape == (16,)
+    assert transformed_dist.rsample().shape == (16,)
+
+@param('pos_fn', ['exp', 'softplus', 'elu'])
+def test_transformed_params_are_differentiable(pos_fn):
+    beta = Beta(pos_fn = pos_fn)
+    params = torch.randn(16, 2, requires_grad = True)
+
+    transformed = beta.to_transformed(params)
+    dist = beta.from_transformed(transformed)
+    dist.rsample().sum().backward()
+
+    assert params.grad is not None
+    assert torch.isfinite(params.grad).all()
+
+def test_deterministic_transformed():
+    beta = Beta()
+    action = torch.rand(16) * 2. - 1.
+
+    transformed = beta.deterministic_transformed(action)
+    dist = beta.from_transformed(transformed)
+
+    assert (dist.mean - action).abs().max() < 1e-2
+    assert dist.variance.max() < 1e-3

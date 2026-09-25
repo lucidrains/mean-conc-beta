@@ -1,6 +1,7 @@
 from mean_conc_beta.mean_conc_beta import (
     Beta,
     TransformedBeta,
+    TransformedParams,
     Deterministic,
     LeakyTanh,
     leaky_tanh
@@ -9,6 +10,7 @@ from mean_conc_beta.mean_conc_beta import (
 __all__ = [
     'Beta',
     'TransformedBeta',
+    'TransformedParams',
     'Deterministic',
     'LeakyTanh',
     'leaky_tanh'
