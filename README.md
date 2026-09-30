@@ -17,7 +17,9 @@ from mean_conc_beta import Beta
 # defaults to (-1., 1.), most continuous action spaces are symmetric centered on 0, sometimes off by a scale
 # but you can pass in custom bounds, e.g. Beta((-0.4, 0.4))
 
-beta = Beta()
+# detach the mean before entropy so the bonus only regularizes concentration (default True)
+
+beta = Beta(detach_entropy_mean = True)
 
 # network output: (batch, num_actions, 2) for raw mean and concentration
 
