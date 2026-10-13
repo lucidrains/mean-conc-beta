@@ -286,6 +286,78 @@ def test_arbitrary_range():
     assert ((dist.sample() >= -2.) & (dist.sample() <= 2.)).all()
     assert torch.allclose(beta.entropy(dist, sum_action_dim = False), dist.base_dist.entropy() + math.log(4.), atol = 1e-4)
 
+# the uniform prior loss - kl against the uniform on the bounds reduces to the negative base beta entropy
+
+@param('pos_fn', ['exp', 'softplus', 'elu'])
+@param('val_range', [(-1., 1.), (0., 1.), (-3., 5.)])
+def test_kl_uniform(pos_fn, val_range):
+    torch.manual_seed(0)
+
+    beta = Beta(pos_fn = pos_fn, val_range = val_range, unimodal = False)
+    params = torch.stack((torch.randn(8, 4), torch.randn(8, 4)), dim = -1)
+
+    kl = beta.kl_uniform(params)
+    assert kl.shape == (8,)
+
+    unit_mean, conc = beta.concentrations(params)
+    alpha, beta_conc = unit_mean * conc, (1. - unit_mean) * conc
+
+    # closed form -H(beta) = -[log B(alpha, beta) - (alpha - 1) psi(alpha) - (beta - 1) psi(beta) + (alpha + beta - 2) psi(alpha + beta)]
+
+    expected = (
+        -torch.lgamma(alpha) - torch.lgamma(beta_conc) + torch.lgamma(alpha + beta_conc)
+        + (alpha - 1.) * torch.digamma(alpha)
+        + (beta_conc - 1.) * torch.digamma(beta_conc)
+        - (alpha + beta_conc - 2.) * torch.digamma(alpha + beta_conc)
+    ).sum(dim = -1)
+
+    assert torch.allclose(kl, expected, atol = 1e-5)
+    assert (kl >= -1e-6).all()
+
+    # invariant to the bounds, as everything but the shapes of the beta cancels
+
+    other_bounds = Beta(pos_fn = pos_fn, val_range = (10., 11.), unimodal = False).kl_uniform(params)
+    assert torch.allclose(kl, other_bounds, atol = 1e-6)
+
+    # gradients flow through both the mean and the concentration
+
+    params = params.detach().requires_grad_()
+    beta.kl_uniform(params).sum().backward()
+
+    assert torch.isfinite(params.grad).all()
+    assert (params.grad.abs() > 0.).all()
+
+    assert torch.allclose(beta.prior_loss(params.detach()), beta.kl_uniform(params.detach()))
+
+def test_kl_uniform_zero_at_uniform():
+    # init_conc = 2 with a raw mean of 0 gives alpha = beta = 1, exactly the uniform, so the kl is 0
+
+    kl = Beta(init_conc = 2., unimodal = False).kl_uniform(torch.zeros(8, 4, 2))
+    assert kl.shape == (8,)
+    assert torch.allclose(kl, torch.zeros(8), atol = 1e-5)
+
+    # the deterministic distribution (temperature = 0) is asserted out
+
+    with raises(AssertionError):
+        Beta(unimodal = False).kl_uniform(torch.randn(8, 4, 2), temperature = 0.)
+
+def test_kl_uniform_monte_carlo():
+    torch.manual_seed(0)
+
+    val_range = (-2., 3.)
+    beta = Beta(val_range = val_range, unimodal = False)
+
+    # moderate concentrations, where a plain monte carlo estimate of E_p[log p - log uniform] is tight
+
+    params = torch.stack((torch.randn(8, 3) * 0.3, torch.randn(8, 3) * 0.2), dim = -1).double()
+    dist = beta(params)
+
+    samples = dist.rsample((200_000,))
+    log_uniform = -math.log(val_range[1] - val_range[0])
+
+    kl_mc = (dist.log_prob(samples) - log_uniform).mean(dim = 0)
+    assert torch.allclose(kl_mc, beta.kl_uniform(params, sum_action_dim = False), atol = 2e-2)
+
 # raw concentration is clamped to keep init_conc exact and extremes stable
 
 def test_concentration_clamp():

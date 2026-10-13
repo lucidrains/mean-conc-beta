@@ -612,6 +612,25 @@ class Beta(Module):
 
     kl = kl_divergence
 
+    # the uniform prior loss - kl(p || uniform on the bounds) collapses to the negative base beta entropy,
+    # as the affine rescale contributes log(scale) to both the entropy and the uniform log density, which cancels exactly
+
+    def kl_uniform(
+        self,
+        params_or_dist: Tensor | Distribution,
+        sum_action_dim = True,
+        temperature: float = 1.
+    ) -> Tensor:
+        dist = self.to_dist(params_or_dist, temperature = temperature)
+        base_dist = dist.base_dist if isinstance(dist, TransformedBeta) else dist
+
+        assert not isinstance(base_dist, Deterministic), 'kl_uniform is not defined for a deterministic distribution (temperature = 0)'
+
+        kl = -base_dist.entropy()
+        return torch.einsum('... a -> ...', kl) if sum_action_dim else kl
+
+    prior_loss = kl_uniform
+
     def log_prob(
         self,
         params_or_dist: Tensor | Distribution,
