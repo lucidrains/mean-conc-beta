@@ -156,7 +156,7 @@ def test_positional_bounds_and_pos_fn():
 
 # log prob stays finite and differentiable at and beyond the support bounds
 
-@param('val_range', [(-1., 1.), (0., 1.)])
+@param('val_range', [(-1., 1.), (0., 1.), (-512., 512.)])
 def test_log_prob_at_bounds(val_range):
     beta = Beta(val_range = val_range)
     params = torch.randn(2, requires_grad = True)
@@ -705,3 +705,49 @@ def test_deterministic_transformed():
 
     assert (dist.mean - action).abs().max() < 1e-2
     assert dist.variance.max() < 1e-3
+
+# regression - a saturated raw mean with wide bounds must not produce a zero beta concentration
+# (1. - eps / scale can round back to 1. in float32, e.g. at action bounds of 512.)
+
+@param('unimodal', [True, False])
+@param('param_with_alpha_beta', [True, False])
+@param('raw_mean', [20., 100., 1e4, -1e4])
+@param('dtype', [torch.float32, torch.float64])
+def test_saturated_mean_stays_valid(unimodal, param_with_alpha_beta, raw_mean, dtype):
+    beta = Beta(
+        bounds = [-512., 512.],
+        init_conc = 2.,
+        unimodal = unimodal,
+        param_with_alpha_beta = param_with_alpha_beta,
+        eps = 1e-5
+    )
+
+    raw_conc = 0. if not param_with_alpha_beta else 1e-3
+    params = tensor([[raw_mean, raw_conc], [-raw_mean, raw_conc]], dtype = dtype, requires_grad = True)
+
+    dist = beta(params)
+    actions = dist.sample()
+    assert torch.isfinite(actions).all()
+    assert torch.isfinite(beta.log_prob(dist, actions)).all()
+    assert torch.isfinite(beta.entropy(dist)).all()
+
+    dist.mean.sum().backward()
+    assert torch.isfinite(params.grad).all()
+
+# tiny eps must still keep the concentrations positive
+
+@param('unimodal', [True, False])
+def test_tiny_eps_stays_valid(unimodal):
+    beta = Beta(
+        bounds = [-512., 512.],
+        init_conc = 2.,
+        unimodal = unimodal,
+        eps = 1e-12
+    )
+
+    params = tensor([[50., 0.], [-50., 0.]], requires_grad = True)
+
+    dist = beta(params)
+    actions = dist.sample()
+    assert torch.isfinite(actions).all()
+    assert torch.isfinite(beta.log_prob(dist, actions)).all()

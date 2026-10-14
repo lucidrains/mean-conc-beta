@@ -35,6 +35,14 @@ def straight_through(x: Tensor, y: Tensor) -> Tensor:
 def parse_sample_shape(sample_shape) -> Size:
     return Size((sample_shape,) if isinstance(sample_shape, int) else sample_shape)
 
+def clamp_unit_interval(x: Tensor, eps: float | Tensor) -> Tensor:
+    # clamp into (0, 1) at representable bounds - 1. - eps rounds back onto 1. in float32 for small eps,
+    # leaving a zero beta concentration
+    finfo = torch.finfo(x.dtype)
+    lo = as_tensor(eps, device = x.device, dtype = x.dtype).clamp(min = finfo.tiny, max = 0.5)
+    hi = (1. - lo).clamp(max = 1. - finfo.eps / 2)
+    return x.clamp(min = lo, max = hi)
+
 def clamp(x, low, high):
     if isinstance(x, ndarray):
         return clamp(as_tensor(x), low, high).numpy()
@@ -172,16 +180,14 @@ class TransformedBeta(TransformedDistribution):
         value: Tensor,
         eps: float | None = None
     ) -> Tensor:
-        device, dtype = value.device, value.dtype
         eps = default(eps, self.eps)
 
-        low, high = [
-            as_tensor(t, device = device, dtype = dtype)
-            for t in self.bounds
-        ]
+        # clamp past the affine inverse, as an action space clamp can be rounded back onto the bound at float32
 
-        value = value.clamp(min = low + eps, max = high - eps)
-        return super().log_prob(value)
+        scale = self.transform.scale
+        unit_value = clamp_unit_interval(self.transform.inv(value), eps / scale)
+
+        return self.base_dist.log_prob(unit_value) - scale.abs().log()
 
     @property
     def mean(self) -> Tensor:
@@ -476,11 +482,10 @@ class Beta(Module):
 
         conc = self.maybe_straight_through(conc, conc + floor)
 
-        # nudge the mean just enough to keep both concentrations above one while preserving the total,
-        # with a relative eps lifting the bound past the float rounding of bound * conc
+        # nudge the mean just enough to keep both concentrations above one while preserving the total
 
         bound = ((1. + self.eps) / conc.clamp(min = 2.)).clamp(max = 0.5)
-        clamped = unit_mean.clamp(min = bound, max = 1. - bound)
+        clamped = clamp_unit_interval(unit_mean, bound)
         unit_mean = self.maybe_straight_through(unit_mean, clamped)
 
         return unit_mean, conc
@@ -491,7 +496,7 @@ class Beta(Module):
         scale = as_tensor(self.scale, device = unit_mean.device, dtype = unit_mean.dtype)
         eps = self.eps / scale
 
-        return straight_through(unit_mean, unit_mean.clamp(min = eps, max = 1. - eps))
+        return straight_through(unit_mean, clamp_unit_interval(unit_mean, eps))
 
     def unit_mean(
         self,
@@ -544,6 +549,8 @@ class Beta(Module):
 
         if apply_unimodal and self.unimodal:
             unit_mean, conc = self.unimodal_concentrations(unit_mean, conc)
+        else:
+            unit_mean = self.clamp_unit_mean(unit_mean)
 
         loc, scale = (as_tensor(t, device = unit_mean.device, dtype = unit_mean.dtype) for t in (self.loc, self.scale))
         transform = AffineTransform(loc = loc, scale = scale)
@@ -558,7 +565,7 @@ class Beta(Module):
     ) -> TransformedParams:
         loc, scale = (as_tensor(t, device = action.device, dtype = action.dtype) for t in (self.loc, self.scale))
 
-        unit_mean = ((action - loc) / scale).clamp(min = self.eps, max = 1. - self.eps)
+        unit_mean = clamp_unit_interval((action - loc) / scale, self.eps)
         conc = torch.full_like(unit_mean, concentration)
 
         return TransformedParams(unit_mean, conc)
