@@ -221,9 +221,8 @@ class TransformedBeta(TransformedDistribution):
         log_scale = as_tensor(self.transform.scale).abs().log()
         return self.entropy_base_dist.entropy() + log_scale
 
-# directed leaky tanh - exact tanh forward, straight through backward with the leak
-# applied only when escaping saturation (moving inward towards 0), preserving tanh's natural
-# vanishing derivative when pushing further into saturation
+# directed leaky tanh - exact tanh forward, backward floored at leak only when escaping
+# saturation (moving inward towards 0), keeping the vanishing gradient when pushing further in
 
 class DirectedLeakyTanh(Function):
     @staticmethod
@@ -294,6 +293,14 @@ POS_FNS = dict(
     elu = PosFn(elu_plus_one, inv_elu_plus_one, identity)
 )
 
+# penalty on the amount an action lands past the bounds - mse, or huber to keep pulling
+# a mean that has drifted far out in, where the mse gradient vanishes
+
+BOUNDS_LOSS_FNS = dict(
+    mse = lambda x: F.mse_loss(x, torch.zeros_like(x), reduction = 'none'),
+    huber = lambda x: F.smooth_l1_loss(x, torch.zeros_like(x), reduction = 'none')
+)
+
 # unit mean and concentration to the two beta concentrations
 
 def to_concentrations(unit_mean: Tensor, conc: Tensor) -> tuple[Tensor, Tensor]:
@@ -328,7 +335,8 @@ class Beta(Module):
         target_range = None,
         clamp_log_conc = None,
         squash_fn = 'leaky_tanh',
-        param_with_alpha_beta = False
+        param_with_alpha_beta = False,
+        overshoot: float | None = None
     ):
         super().__init__()
 
@@ -384,6 +392,7 @@ class Beta(Module):
         self.loc = self.low
         self.scale = self.high - self.low
         self.target_range = target_range
+        self.overshoot = overshoot
 
         # raw offset so concentration at raw_conc = 0 is exactly init_conc
 
@@ -397,6 +406,11 @@ class Beta(Module):
     @property
     def bounds(self):
         return self.low, self.high
+
+    def affine(self, ref: Tensor) -> AffineTransform:
+        # loc and scale cast to the reference tensor's device and dtype
+        loc, scale = (as_tensor(t, device = ref.device, dtype = ref.dtype) for t in (self.loc, self.scale))
+        return AffineTransform(loc = loc, scale = scale)
 
     @property
     def clamp_log_conc(self) -> float | None:
@@ -438,6 +452,18 @@ class Beta(Module):
         return rescaled_step
 
     rescale_step = rescale_env_step
+
+    # kwargs for env_ssl_wrapper's ActionTransformWrapper - the overshoot maps a little past
+    # the bounds before the clip, so the unimodal mean clamp cannot hold the action short of one
+
+    def action_transform_kwargs(self):
+        from_range = tuple(b.item() if b.ndim == 0 else tuple(b.tolist()) for b in self.bounds)
+
+        return dict(
+            auto = True,
+            from_range = from_range,
+            overshoot = self.overshoot
+        )
 
     def to_dist(
         self,
@@ -552,8 +578,7 @@ class Beta(Module):
         else:
             unit_mean = self.clamp_unit_mean(unit_mean)
 
-        loc, scale = (as_tensor(t, device = unit_mean.device, dtype = unit_mean.dtype) for t in (self.loc, self.scale))
-        transform = AffineTransform(loc = loc, scale = scale)
+        transform = self.affine(unit_mean)
 
         base_dist = to_beta(unit_mean, conc)
         return TransformedBeta(base_dist, transform, eps = self.eps)
@@ -563,9 +588,7 @@ class Beta(Module):
         action: Tensor,
         concentration: float = 1e3
     ) -> TransformedParams:
-        loc, scale = (as_tensor(t, device = action.device, dtype = action.dtype) for t in (self.loc, self.scale))
-
-        unit_mean = clamp_unit_interval((action - loc) / scale, self.eps)
+        unit_mean = clamp_unit_interval(self.affine(action).inv(action), self.eps)
         conc = torch.full_like(unit_mean, concentration)
 
         return TransformedParams(unit_mean, conc)
@@ -583,8 +606,8 @@ class Beta(Module):
         else:
             unit_mean, _ = self.concentrations(params_or_dist)
 
-        loc, scale = (as_tensor(t, device = params_or_dist.device, dtype = params_or_dist.dtype) for t in (self.loc, self.scale))
-        return loc + unit_mean * scale
+        transform = self.affine(params_or_dist)
+        return transform.loc + unit_mean * transform.scale
 
     def mode(
         self,
@@ -638,6 +661,36 @@ class Beta(Module):
 
     prior_loss = kl_uniform
 
+    # the out of bounds loss - the penalty on the mean action landing past the bounds, i.e. on
+    # what the action transform clips away. zero inside, mse / huber / any callable outside
+
+    def out_of_bounds_loss(
+        self,
+        params_or_dist: Tensor | Distribution,
+        bounds = None,
+        loss_fn = 'mse',
+        sum_action_dim = True
+    ) -> Tensor:
+        if isinstance(loss_fn, str):
+            assert loss_fn in BOUNDS_LOSS_FNS, f'loss_fn must be one of {tuple(BOUNDS_LOSS_FNS.keys())} or a callable'
+            loss_fn = BOUNDS_LOSS_FNS[loss_fn]
+
+        assert callable(loss_fn), 'loss_fn must be callable'
+
+        low, high = parse_bounds(default(bounds, self.bounds))
+        action = self.mean(params_or_dist)
+        low, high = (as_tensor(t, device = action.device, dtype = action.dtype) for t in (low, high))
+
+        # the action transform stretches by 1 + overshoot before it clips
+
+        if exists(self.overshoot):
+            center = (low + high) / 2.
+            action = center + (action - center) * (1. + self.overshoot)
+
+        loss = loss_fn((action - clamp(action, low, high)).abs())
+
+        return loss.sum(dim = -1) if sum_action_dim else loss
+
     def log_prob(
         self,
         params_or_dist: Tensor | Distribution,
@@ -687,8 +740,7 @@ class Beta(Module):
 
         detach_entropy_mean = default(detach_entropy_mean, self.detach_entropy_mean)
 
-        loc, scale = (as_tensor(t, device = params.device, dtype = params.dtype) for t in (self.loc, self.scale))
-        transform = AffineTransform(loc = loc, scale = scale)
+        transform = self.affine(params)
 
         # deterministic greedy action when temperature is 0
 

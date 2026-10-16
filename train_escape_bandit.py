@@ -9,8 +9,7 @@
 # ///
 
 # escape bandit - reward depends only on the mean of the beta, target flips to the opposite bound
-# halfway through. leaky tanh escapes within the budget, while tanh and the regular alpha / beta
-# parameterization stall at the first bound
+# halfway through - leaky tanh escapes, tanh and alpha / beta stall at the first bound
 
 from __future__ import annotations
 

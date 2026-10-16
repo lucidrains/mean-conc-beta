@@ -11,7 +11,7 @@ from torch import tensor
 import gymnasium as gym
 
 from mean_conc_beta import Beta, LeakyTanh, leaky_tanh
-from mean_conc_beta.mean_conc_beta import clamp
+from mean_conc_beta.mean_conc_beta import BOUNDS_LOSS_FNS, clamp
 
 # e2e - forward, sample, rsample, log prob, entropy, mode, backward
 
@@ -246,9 +246,8 @@ def test_non_unimodal_mode(bounds):
     beta = Beta(bounds = bounds, unimodal = False, pos_fn = 'exp')
     low, high = bounds
 
-    # (unit mean, concentration) -> alpha = unit mean * conc, beta = (1 - unit mean) * conc
-    # J shape: alpha > 1, beta <= 1 -> high bound; alpha <= 1, beta > 1 -> low bound
-    # U shape: alpha, beta < 1 -> nearest bound
+    # (unit mean, conc) -> alpha = um * conc, beta = (1 - um) * conc
+    # J shapes land on a bound by whichever concentration exceeds one, U shapes on the nearest
 
     cases = [
         (0.8, 1.5, 1.),
@@ -751,3 +750,86 @@ def test_tiny_eps_stays_valid(unimodal):
     actions = dist.sample()
     assert torch.isfinite(actions).all()
     assert torch.isfinite(beta.log_prob(dist, actions)).all()
+
+# the out of bounds loss - the amount a mean action lands past the bounds, zero inside
+
+@param('loss_fn', list(BOUNDS_LOSS_FNS.keys()))
+def test_out_of_bounds_loss_fns(loss_fn):
+    beta = Beta(bounds = (-1., 1.), overshoot = 0.1)
+    loss = beta.out_of_bounds_loss(tensor([[[10., 0.], [0., 0.]]]), loss_fn = loss_fn, sum_action_dim = False)
+
+    assert torch.isfinite(loss).all()
+    assert (loss >= 0.).all()
+    assert loss[0, 1] == 0.
+    assert loss[0, 0] > 0.
+
+def test_out_of_bounds_loss():
+    params = tensor([[[10., 0.], [0., 0.], [-10., 0.]]])   # a batch of three actions
+
+    # no overshoot, the mean is always inside the bounds
+
+    assert torch.allclose(Beta(bounds = (-1., 1.)).out_of_bounds_loss(params), torch.zeros(1))
+
+    # a saturated mean lands that much past the bound, squared
+
+    beta = Beta(bounds = (-1., 1.), overshoot = 0.1)
+    past = beta.mean(params)[0, 0].abs().item() * 1.1 - 1.
+
+    assert torch.allclose(beta.out_of_bounds_loss(params, sum_action_dim = False), tensor([[past ** 2, 0., past ** 2]]), atol = 1e-5)
+
+    # bounds overridable, backward works
+
+    assert (beta.out_of_bounds_loss(params, bounds = (-0.5, 0.5)) > beta.out_of_bounds_loss(params)).all()
+
+    differentiable = tensor([[[10., 0.], [0., 0.]]], requires_grad = True)
+    beta.out_of_bounds_loss(differentiable).sum().backward()
+    assert torch.isfinite(differentiable.grad).all()
+
+# mse lets go of a mean that is far out, huber keeps pulling, or any callable
+
+def test_out_of_bounds_loss_fns_far_out():
+    params = tensor([[[10., 0.]]])
+    beta = Beta(bounds = (-1., 1.), overshoot = 3.)
+    far = beta.mean(params)[0, 0].abs() * 4. - 1.
+    assert far > 1.
+
+    assert torch.allclose(beta.out_of_bounds_loss(params, loss_fn = 'mse'), tensor([far ** 2]), atol = 1e-4)
+    assert torch.allclose(beta.out_of_bounds_loss(params, loss_fn = 'huber'), tensor([far - 0.5]), atol = 1e-4)
+    assert torch.allclose(beta.out_of_bounds_loss(params, loss_fn = lambda x: x), tensor([far]), atol = 1e-4)
+
+    with raises(AssertionError):
+        beta.out_of_bounds_loss(params, loss_fn = 'unknown')
+
+# env wrapper kwargs - the action transform rescales the policy range onto the env bounds,
+# with an optional overshoot that is clipped back onto them
+
+def test_action_transform_kwargs():
+    beta = Beta(bounds = (-2., 2.))
+    assert beta.action_transform_kwargs() == dict(auto = True, from_range = (-2., 2.), overshoot = None)
+
+    beta = Beta(bounds = (-2., 2.), overshoot = 0.05)
+    assert beta.action_transform_kwargs() == dict(auto = True, from_range = (-2., 2.), overshoot = 0.05)
+
+    beta = Beta(bounds = [(0., 1.), (-2., 2.)], overshoot = 0.05)
+    assert beta.action_transform_kwargs() == dict(auto = True, from_range = ((0., -2.), (1., 2.)), overshoot = 0.05)
+
+# e2e with env_ssl_wrapper if installed - a saturated mean action is clipped onto the env bound
+
+def test_action_transform_kwargs_reach_bound():
+    pytest.importorskip('env_ssl_wrapper')
+
+    from env_ssl_wrapper.standardize import ActionTransformWrapper
+    from env_ssl_wrapper.standardize.mocks import GymnasiumMockEnv
+
+    # the mock env's bounds are the beta default (-1., 1.)
+
+    beta = Beta(overshoot = 0.05)
+    env = ActionTransformWrapper(GymnasiumMockEnv(), **beta.action_transform_kwargs())
+
+    # a saturated mean still lands short of a bound, the wrapper clips the overshoot onto it
+
+    saturated = beta.mean(tensor([[10., 0.], [-10., 0.]]))
+    assert (saturated.abs() < 1. - 1e-3).all()
+
+    env.step(saturated)
+    assert torch.allclose(torch.from_numpy(env.last_action), tensor([1., -1.]), atol = 1e-5)

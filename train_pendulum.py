@@ -199,6 +199,7 @@ def train_pendulum(
             dataloader = buffer.dataloader(
                 batch_size = batch_size,
                 timestep_level = True,
+                shuffle = True,
                 to_named_tuple = ('obs', 'action', 'log_prob', 'advantage', 'returns')
             )
 

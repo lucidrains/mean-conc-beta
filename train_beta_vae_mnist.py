@@ -1,7 +1,5 @@
-# a minimal mnist vae with a beta posterior on (-1, 1) and the uniform prior,
-# trained with the importance weighted bound (iwae, burda et al.) over k posterior candidates,
-# the smooth form of forward explorative modeling (gladstone et al.)
-# needs einops, torch-einops-utils, torchvision, umap-learn and matplotlib
+# a minimal mnist vae with a beta posterior on (-1, 1) and the uniform prior, trained with the
+# importance weighted bound (iwae, burda et al.) - needs einops, torch-einops-utils, torchvision, umap, matplotlib
 
 import math
 from pathlib import Path
