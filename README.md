@@ -17,9 +17,9 @@ from mean_conc_beta import Beta
 # defaults to (-1., 1.), most continuous action spaces are symmetric centered on 0, sometimes off by a scale
 # but you can pass in custom bounds, e.g. Beta((-0.4, 0.4))
 
-# detach the mean before entropy so the bonus only regularizes concentration (default True)
+# the entropy bonus only regularizes concentration by default, without moving the mean
 
-beta = Beta(detach_entropy_mean = True)
+beta = Beta()
 
 # network output: (batch, num_actions, 2) for raw mean and concentration
 
@@ -52,6 +52,18 @@ pred_mean = beta.mean(params)
 
 bc_loss = (pred_mean - expert_actions).pow(2).mean()
 bc_loss.backward()
+```
+
+## Greedy actions and uniform prior
+
+```python
+# temperature = 0. gives a point mass at the mean, useful for evaluation
+
+action = beta(params, temperature = 0.).mean
+
+# kl against the uniform on the bounds, for prior regularization
+
+prior_loss = beta.kl_uniform(params).mean()
 ```
 
 ## Per-action bounds

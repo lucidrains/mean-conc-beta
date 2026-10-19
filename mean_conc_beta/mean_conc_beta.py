@@ -1,22 +1,22 @@
 from __future__ import annotations
+
 import math
 from collections import namedtuple
 from functools import wraps
 
-from numpy import ndarray
-
 import torch
-from torch import Tensor, Size, is_tensor, as_tensor
 import torch.nn.functional as F
-from torch.nn import Module
+from numpy import ndarray
+from torch import Size, Tensor, as_tensor, is_tensor
 from torch.autograd import Function
 from torch.distributions import (
-    Distribution,
+    AffineTransform,
     Beta as _Beta,
-    TransformedDistribution,
-    AffineTransform
+    Distribution,
+    TransformedDistribution
 )
 from torch.distributions.kl import kl_divergence, register_kl
+from torch.nn import Module
 
 # helpers
 
@@ -39,7 +39,13 @@ def clamp_unit_interval(x: Tensor, eps: float | Tensor) -> Tensor:
     # clamp into (0, 1) at representable bounds - 1. - eps rounds back onto 1. in float32 for small eps,
     # leaving a zero beta concentration
     finfo = torch.finfo(x.dtype)
-    lo = as_tensor(eps, device = x.device, dtype = x.dtype).clamp(min = finfo.tiny, max = 0.5)
+
+    if not is_tensor(eps):
+        lo = min(max(float(eps), finfo.tiny), 0.5)
+        hi = min(1. - lo, 1. - finfo.eps / 2)
+        return x.clamp(min = lo, max = hi)
+
+    lo = eps.to(device = x.device, dtype = x.dtype).clamp(min = finfo.tiny, max = 0.5)
     hi = (1. - lo).clamp(max = 1. - finfo.eps / 2)
     return x.clamp(min = lo, max = hi)
 
@@ -66,6 +72,9 @@ def parse_bounds(bounds):
         bounds = as_tensor(bounds)
 
     assert bounds.ndim in (1, 2) and bounds.shape[-1] == 2, f'bounds must have shape (2,) or (num_actions, 2), got {tuple(bounds.shape)}'
+
+    if not bounds.is_floating_point():
+        bounds = bounds.float()
 
     low, high = bounds.unbind(dim = -1)
     assert (low < high).all(), 'lower bounds must be less than upper bounds'
@@ -140,14 +149,20 @@ class TransformedBeta(TransformedDistribution):
         base_dist: Distribution,
         transform: AffineTransform,
         entropy_base_dist: Distribution | None = None,
-        eps: float = 1e-5
+        eps: float = 1e-5,
+        detach_entropy_mean: bool = False,
+        log_scale: Tensor | None = None,
+        unit_eps: float | Tensor | None = None
     ):
         assert isinstance(transform, AffineTransform), 'TransformedBeta only supports affine transforms'
         assert transform.event_dim == 0, 'TransformedBeta only supports non-event affine transforms'
 
         self.eps = eps
-        self.entropy_base_dist = default(entropy_base_dist, base_dist)
-        super().__init__(base_dist, transform)
+        self.entropy_base_dist = entropy_base_dist
+        self.detach_entropy_mean = detach_entropy_mean
+        self.log_scale = log_scale if exists(log_scale) else as_tensor(transform.scale).log()
+        self.unit_eps = unit_eps if exists(unit_eps) else eps / as_tensor(transform.scale)
+        super().__init__(base_dist, transform, validate_args = False)
 
     def sample(self, sample_shape = ()):
         return super().sample(parse_sample_shape(sample_shape))
@@ -160,19 +175,19 @@ class TransformedBeta(TransformedDistribution):
         return self.transforms[0]
 
     @property
-    def low(self):
+    def low(self) -> Tensor:
         return self.transform.loc
 
     @property
-    def high(self):
+    def high(self) -> Tensor:
         return self.transform.loc + self.transform.scale
 
     @property
-    def bounds(self):
+    def bounds(self) -> tuple[Tensor, Tensor]:
         return self.low, self.high
 
     @property
-    def scale(self):
+    def scale(self) -> Tensor:
         return self.transform.scale
 
     def log_prob(
@@ -180,14 +195,12 @@ class TransformedBeta(TransformedDistribution):
         value: Tensor,
         eps: float | None = None
     ) -> Tensor:
-        eps = default(eps, self.eps)
-
         # clamp past the affine inverse, as an action space clamp can be rounded back onto the bound at float32
 
-        scale = self.transform.scale
-        unit_value = clamp_unit_interval(self.transform.inv(value), eps / scale)
+        unit_eps = self.unit_eps if not exists(eps) else eps / as_tensor(self.transform.scale)
+        unit_value = clamp_unit_interval(self.transform.inv(value), unit_eps)
 
-        return self.base_dist.log_prob(unit_value) - scale.abs().log()
+        return self.base_dist.log_prob(unit_value) - self.log_scale
 
     @property
     def mean(self) -> Tensor:
@@ -214,12 +227,38 @@ class TransformedBeta(TransformedDistribution):
     def variance(self) -> Tensor:
         return self.base_dist.variance * self.transform.scale ** 2
 
-    def entropy(self) -> Tensor:
+    def base_entropy(self, detach_mean: bool | None = None) -> Tensor:
+        if exists(self.entropy_base_dist):
+            return self.entropy_base_dist.entropy()
+
+        base_dist = self.base_dist
+
+        # detach the mean lazily, so only the concentration is regularized
+
+        detach_mean = default(detach_mean, self.detach_entropy_mean)
+
+        if detach_mean and isinstance(base_dist, _Beta):
+            conc = base_dist.concentration1 + base_dist.concentration0
+            base_dist = to_beta(base_dist.mean.detach(), conc)
+
+        return base_dist.entropy()
+
+    def entropy(self, detach_mean: bool | None = None) -> Tensor:
         if isinstance(self.base_dist, Deterministic):
             return torch.zeros_like(self.base_dist.value)
 
-        log_scale = as_tensor(self.transform.scale).abs().log()
-        return self.entropy_base_dist.entropy() + log_scale
+        return self.base_entropy(detach_mean = detach_mean) + self.log_scale
+
+# within one module both dists share the affine bounds, so the jacobian cancels
+
+@register_kl(TransformedBeta, TransformedBeta)
+def _kl_transformed_beta(p: TransformedBeta, q: TransformedBeta) -> Tensor:
+    same_loc = p.transform.loc is q.transform.loc or torch.equal(as_tensor(p.transform.loc), as_tensor(q.transform.loc))
+    same_scale = p.transform.scale is q.transform.scale or torch.equal(as_tensor(p.transform.scale), as_tensor(q.transform.scale))
+
+    assert same_loc and same_scale, 'kl between transformed betas requires matching affine bounds'
+
+    return kl_divergence(p.base_dist, q.base_dist)
 
 # directed leaky tanh - exact tanh forward, backward floored at leak only when escaping
 # saturation (moving inward towards 0), keeping the vanishing gradient when pushing further in
@@ -297,8 +336,8 @@ POS_FNS = dict(
 # a mean that has drifted far out in, where the mse gradient vanishes
 
 BOUNDS_LOSS_FNS = dict(
-    mse = lambda x: F.mse_loss(x, torch.zeros_like(x), reduction = 'none'),
-    huber = lambda x: F.smooth_l1_loss(x, torch.zeros_like(x), reduction = 'none')
+    mse = torch.square,
+    huber = lambda x: torch.where(x < 1., 0.5 * x.square(), x - 0.5)
 )
 
 # unit mean and concentration to the two beta concentrations
@@ -307,7 +346,7 @@ def to_concentrations(unit_mean: Tensor, conc: Tensor) -> tuple[Tensor, Tensor]:
     return unit_mean * conc, (1. - unit_mean) * conc
 
 def to_beta(unit_mean: Tensor, conc: Tensor) -> _Beta:
-    return _Beta(*to_concentrations(unit_mean, conc))
+    return _Beta(*to_concentrations(unit_mean, conc), validate_args = False)
 
 # transformed parameters, the unit mean and total concentration, which can be passed onwards
 # to sampling, entropy, log prob, or as inputs to a critic
@@ -388,9 +427,27 @@ class Beta(Module):
         # bounds / range
 
         val_range = default(bounds, default(range, val_range))
-        self.low, self.high = parse_bounds(val_range)
-        self.loc = self.low
-        self.scale = self.high - self.low
+        low, high = parse_bounds(val_range)
+        scale = high - low
+
+        # buffers move with the module, avoiding a host-to-device copy every forward
+
+        self.register_buffer('low', low, persistent = False)
+        self.register_buffer('high', high, persistent = False)
+        self.register_buffer('loc', low, persistent = False)
+        self.register_buffer('scale', scale, persistent = False)
+
+        # scalar bounds use a python float for the fast clamp path, per-action bounds stay a buffer
+
+        unit_eps = eps / scale
+
+        if unit_eps.ndim == 0:
+            self.unit_eps = unit_eps.item()
+        else:
+            self.register_buffer('unit_eps', unit_eps, persistent = False)
+
+        self.register_buffer('log_scale', scale.log(), persistent = False)
+
         self.target_range = target_range
         self.overshoot = overshoot
 
@@ -400,11 +457,11 @@ class Beta(Module):
         self.raw_init_conc = POS_FNS[pos_fn].inv(delta_conc)
 
     @property
-    def range(self):
+    def range(self) -> tuple[Tensor, Tensor]:
         return self.bounds
 
     @property
-    def bounds(self):
+    def bounds(self) -> tuple[Tensor, Tensor]:
         return self.low, self.high
 
     def affine(self, ref: Tensor) -> AffineTransform:
@@ -519,10 +576,7 @@ class Beta(Module):
     # straight through the eps clamp, so a saturated mean keeps its gradient
 
     def clamp_unit_mean(self, unit_mean: Tensor) -> Tensor:
-        scale = as_tensor(self.scale, device = unit_mean.device, dtype = unit_mean.dtype)
-        eps = self.eps / scale
-
-        return straight_through(unit_mean, clamp_unit_interval(unit_mean, eps))
+        return straight_through(unit_mean, clamp_unit_interval(unit_mean, self.unit_eps))
 
     def unit_mean(
         self,
@@ -533,6 +587,15 @@ class Beta(Module):
 
         raw_mean = params if indexed else params[..., 0]
         return self.clamp_unit_mean((self.squash_fn(raw_mean) + 1.) / 2.)
+
+    def unit_mean_from_params(self, params: Tensor) -> Tensor:
+        if not self.param_with_alpha_beta:
+            return self.unit_mean(params)
+
+        alpha = self.concentration(params[..., 0], indexed = True)
+        beta = self.concentration(params[..., 1], indexed = True)
+
+        return self.clamp_unit_mean(alpha / (alpha + beta))
 
     # raw params to the unit mean and total concentration, one pathway per parameterization,
     # with the unimodal adjustment applied
@@ -579,16 +642,24 @@ class Beta(Module):
             unit_mean = self.clamp_unit_mean(unit_mean)
 
         transform = self.affine(unit_mean)
+        log_scale = self.log_scale.to(device = unit_mean.device, dtype = unit_mean.dtype)
 
         base_dist = to_beta(unit_mean, conc)
-        return TransformedBeta(base_dist, transform, eps = self.eps)
+        return TransformedBeta(
+            base_dist,
+            transform,
+            detach_entropy_mean = self.detach_entropy_mean,
+            eps = self.eps,
+            log_scale = log_scale,
+            unit_eps = self.unit_eps
+        )
 
     def deterministic_transformed(
         self,
         action: Tensor,
         concentration: float = 1e3
     ) -> TransformedParams:
-        unit_mean = clamp_unit_interval(self.affine(action).inv(action), self.eps)
+        unit_mean = clamp_unit_interval(self.affine(action).inv(action), self.unit_eps)
         conc = torch.full_like(unit_mean, concentration)
 
         return TransformedParams(unit_mean, conc)
@@ -603,8 +674,10 @@ class Beta(Module):
 
         if indexed:
             unit_mean = self.unit_mean(params_or_dist, indexed = True)
-        else:
+        elif self.unimodal:
             unit_mean, _ = self.concentrations(params_or_dist)
+        else:
+            unit_mean = self.unit_mean_from_params(params_or_dist)
 
         transform = self.affine(params_or_dist)
         return transform.loc + unit_mean * transform.scale
@@ -624,8 +697,8 @@ class Beta(Module):
         temperature: float = 1.,
         detach_mean: bool | None = None
     ) -> Tensor:
-        dist = self.to_dist(params_or_dist, temperature = temperature, detach_entropy_mean = detach_mean)
-        entropy = dist.entropy()
+        dist = self.to_dist(params_or_dist, temperature = temperature)
+        entropy = dist.entropy(detach_mean = detach_mean) if isinstance(dist, TransformedBeta) else dist.entropy()
         return entropy.sum(dim = -1) if sum_action_dim else entropy
 
     def kl_divergence(
@@ -649,15 +722,16 @@ class Beta(Module):
         self,
         params_or_dist: Tensor | Distribution,
         sum_action_dim = True,
-        temperature: float = 1.
+        temperature: float = 1.,
+        detach_mean: bool | None = None
     ) -> Tensor:
         dist = self.to_dist(params_or_dist, temperature = temperature)
         base_dist = dist.base_dist if isinstance(dist, TransformedBeta) else dist
 
         assert not isinstance(base_dist, Deterministic), 'kl_uniform is not defined for a deterministic distribution (temperature = 0)'
 
-        kl = -base_dist.entropy()
-        return torch.einsum('... a -> ...', kl) if sum_action_dim else kl
+        kl = -dist.base_entropy(detach_mean = detach_mean) if isinstance(dist, TransformedBeta) else -base_dist.entropy()
+        return kl.sum(dim = -1) if sum_action_dim else kl
 
     prior_loss = kl_uniform
 
@@ -677,7 +751,7 @@ class Beta(Module):
 
         assert callable(loss_fn), 'loss_fn must be callable'
 
-        low, high = parse_bounds(default(bounds, self.bounds))
+        low, high = parse_bounds(bounds) if exists(bounds) else self.bounds
         action = self.mean(params_or_dist)
         low, high = (as_tensor(t, device = action.device, dtype = action.dtype) for t in (low, high))
 
@@ -742,18 +816,23 @@ class Beta(Module):
 
         transform = self.affine(params)
 
-        # deterministic greedy action when temperature is 0
+        # deterministic greedy action when temperature is 0, where the concentration limit is infinite
+        # and the unimodal correction vanishes
 
         if temperature == 0.:
-            unit_mean, _ = self.concentrations(params)
-            return TransformedBeta(Deterministic(unit_mean), transform)
+            unit_mean = self.unit_mean_from_params(params)
+            return TransformedBeta(Deterministic(unit_mean), transform, log_scale = self.log_scale, unit_eps = self.unit_eps)
 
         unit_mean, conc = self.concentrations(params, temperature = temperature)
 
         base_dist = to_beta(unit_mean, conc)
+        log_scale = self.log_scale.to(device = params.device, dtype = params.dtype)
 
-        # detach mean so entropy only regularizes concentration without penalizing non-zero mean actions
-
-        entropy_base_dist = to_beta(unit_mean.detach(), conc) if detach_entropy_mean else None
-
-        return TransformedBeta(base_dist, transform, entropy_base_dist = entropy_base_dist, eps = self.eps)
+        return TransformedBeta(
+            base_dist,
+            transform,
+            detach_entropy_mean = detach_entropy_mean,
+            eps = self.eps,
+            log_scale = log_scale,
+            unit_eps = self.unit_eps
+        )

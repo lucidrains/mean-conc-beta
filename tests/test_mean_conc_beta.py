@@ -1,17 +1,17 @@
 from __future__ import annotations
+
 import math
 
-import pytest
-from pytest import raises
-
-param = pytest.mark.parametrize
-
-import torch
-from torch import tensor
 import gymnasium as gym
+import pytest
+import torch
+from pytest import raises
+from torch import tensor
 
 from mean_conc_beta import Beta, LeakyTanh, leaky_tanh
 from mean_conc_beta.mean_conc_beta import BOUNDS_LOSS_FNS, clamp
+
+param = pytest.mark.parametrize
 
 # e2e - forward, sample, rsample, log prob, entropy, mode, backward
 
@@ -141,6 +141,15 @@ def test_bounds(kwargs):
     actions = beta(torch.randn(8, 4, 2)).sample()
     assert ((actions >= -2.) & (actions <= 2.)).all()
 
+def test_integer_bounds_are_float():
+    beta = Beta(bounds = (-1, 1))
+
+    assert beta.low.is_floating_point() and beta.scale.is_floating_point()
+    assert isinstance(beta.unit_eps, float)
+
+    half = beta.half()
+    assert half.low.dtype == torch.float16 and half.scale.dtype == torch.float16
+
 def test_positional_bounds_and_pos_fn():
     beta = Beta((-0.4, 0.4))
     assert beta.bounds == (-0.4, 0.4)
@@ -196,7 +205,10 @@ def test_temperature():
 def test_temperature_zero():
     beta = Beta()
     params = torch.randn(8, 4, 2, requires_grad = True)
-    expected_mean = beta.mean(params)
+
+    # the greedy limit is the raw unit mean, without the finite concentration unimodal nudge
+
+    expected_mean = beta.affine(params)(beta.unit_mean_from_params(params))
 
     dist = beta(params, temperature = 0.)
     assert torch.allclose(dist.mean, expected_mean)
@@ -318,10 +330,19 @@ def test_kl_uniform(pos_fn, val_range):
     other_bounds = Beta(pos_fn = pos_fn, val_range = (10., 11.), unimodal = False).kl_uniform(params)
     assert torch.allclose(kl, other_bounds, atol = 1e-6)
 
-    # gradients flow through both the mean and the concentration
+    # gradients flow through the concentration, with the mean detached by default
 
     params = params.detach().requires_grad_()
     beta.kl_uniform(params).sum().backward()
+
+    assert torch.isfinite(params.grad).all()
+    assert torch.allclose(params.grad[..., 0], torch.zeros_like(params.grad[..., 0]))
+    assert (params.grad[..., 1].abs() > 0.).all()
+
+    # opt out to let the mean move as well
+
+    params = params.detach().requires_grad_()
+    beta.kl_uniform(params, detach_mean = False).sum().backward()
 
     assert torch.isfinite(params.grad).all()
     assert (params.grad.abs() > 0.).all()
@@ -421,6 +442,19 @@ def test_detach_entropy_mean():
     assert torch.allclose(params.grad[0, 0], tensor(0.), atol = 1e-6)
     assert not torch.allclose(params.grad[0, 1], tensor(0.))
 
+# the detach flag can be overridden on an already constructed distribution
+
+def test_detach_entropy_mean_override():
+    beta = Beta()
+
+    def mean_grad(detach_mean):
+        params = tensor([[0.5, 0.]], requires_grad = True)
+        beta.entropy(beta(params), detach_mean = detach_mean).backward()
+        return params.grad[0, 0]
+
+    assert not torch.allclose(mean_grad(False), tensor(0.))
+    assert torch.allclose(mean_grad(True), tensor(0.), atol = 1e-6)
+
 # rescale env step - auto rescale and clip actions into the env action space
 
 def test_rescale_env_step():
@@ -460,7 +494,7 @@ def test_rescale_env_step_gym():
     beta = Beta()
     step = beta.rescale_env_step(env.step, target_range = (-2., 2.))
 
-    obs, reward, terminated, truncated, info = step(beta.sample(torch.randn(1, 2)).numpy())
+    obs, *_ = step(beta.sample(torch.randn(1, 2)).numpy())
 
     assert obs.shape == (3,)
     env.close()
@@ -499,6 +533,16 @@ def test_per_action_bounds(bounds):
     kl = beta.kl_divergence(old_params, params.detach())
     assert kl.shape == (8,)
     assert (kl >= 0.).all()
+
+# kl across separate transforms / mixed precision casts of the same bounds
+
+def test_kl_mixed_precision():
+    beta = Beta()
+    params_p = torch.randn(8, 3, 2).bfloat16()
+    params_q = torch.randn(8, 3, 2).bfloat16()
+
+    kl = beta.kl_divergence(params_p, params_q)
+    assert kl.shape == (8,) and torch.isfinite(kl).all()
 
 # two-action bounds as a list or tuple of pairs
 
@@ -682,6 +726,19 @@ def test_to_from_transformed(pos_fn, param_with_alpha_beta):
     assert transformed_dist.log_prob(actions).shape == (16,)
     assert transformed_dist.entropy().shape == (16,)
     assert transformed_dist.rsample().shape == (16,)
+
+@param('detach_mean', [True, False])
+def test_from_transformed_inherits_detach_entropy_mean(detach_mean):
+    beta = Beta(detach_entropy_mean = detach_mean)
+    params = torch.randn(8, 2, requires_grad = True)
+
+    dist = beta.from_transformed(beta.to_transformed(params))
+    assert dist.detach_entropy_mean is detach_mean
+
+    dist.entropy().sum().backward()
+
+    mean_grad_zero = torch.allclose(params.grad[..., 0], torch.zeros_like(params.grad[..., 0]))
+    assert mean_grad_zero is detach_mean
 
 @param('pos_fn', ['exp', 'softplus', 'elu'])
 def test_transformed_params_are_differentiable(pos_fn):

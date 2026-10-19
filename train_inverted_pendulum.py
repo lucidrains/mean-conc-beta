@@ -21,7 +21,7 @@ import gymnasium as gym
 import fire
 
 from memmap_replay_buffer import ReplayBuffer
-from x_ppo import calc_gae, dones_to_masks, ppo_actor_loss
+from x_ppo import calc_gae, dones_to_masks, ppo_actor_loss, rpo_perturb_mean
 
 from mean_conc_beta import Beta
 
@@ -44,8 +44,23 @@ class Actor(nn.Module):
         )
         self.distr = Beta(bounds = bounds, pos_fn = pos_fn)
 
-    def forward(self, x):
+    def forward(self, x, rpo_alpha = 0., rpo_space = 'raw_mean'):
         params = self.net(x).view(*x.shape[:-1], -1, 2)
+
+        if rpo_alpha > 0.:
+            if rpo_space == 'raw_mean':
+                params = params.clone()
+                params[..., 0] = rpo_perturb_mean(params[..., 0], rpo_alpha)
+                return self.distr(params)
+
+            # literal rpo perturbs the unit mean, but the beta boundary makes the log prob gradients explode
+
+            assert rpo_space == 'unit_mean', f'unknown rpo_space {rpo_space}'
+
+            transformed = self.distr.to_transformed(params)
+            unit_mean = rpo_perturb_mean(transformed.unit_mean, rpo_alpha)
+            return self.distr.from_transformed((unit_mean, transformed.concentration))
+
         return self.distr(params)
 
 class Critic(nn.Module):
@@ -99,10 +114,14 @@ def train_inverted_pendulum(
     max_iterations: int = 20,
     lr: float = 3e-4,
     entropy_coef: float = 0.005,
+    rpo_alpha: float = 0.,
+    rpo_space: str = 'raw_mean',
     seed: int = 42
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
+
+    print(f'rpo_alpha={rpo_alpha}, rpo_space={rpo_space}')
 
     env = gym.make_vec('InvertedPendulum-v5', num_envs = num_envs)
     eval_env = gym.make('InvertedPendulum-v5')
@@ -197,7 +216,7 @@ def train_inverted_pendulum(
             )
 
             for batch in dataloader:
-                dist = actor(batch.obs)
+                dist = actor(batch.obs, rpo_alpha = rpo_alpha, rpo_space = rpo_space)
                 new_log_probs = dist.log_prob(batch.action).sum(dim = -1)
 
                 policy_loss = ppo_actor_loss(new_log_probs, batch.log_prob, batch.advantage).mean() - entropy_coef * dist.entropy().sum(dim = -1).mean()
