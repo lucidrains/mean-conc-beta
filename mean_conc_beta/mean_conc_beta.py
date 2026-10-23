@@ -804,13 +804,38 @@ class Beta(Module):
     ) -> Tensor:
         return self(params, temperature = temperature).rsample(parse_sample_shape(sample_shape))
 
+    def perturb_mean(
+        self,
+        params: Tensor,
+        scale: float = 0.5,
+        temperature: float = 1.,
+        apply_unimodal: bool = False,
+        generator: torch.Generator | None = None
+    ) -> Distribution:
+        # rpo - perturb the mean with uniform noise, keeping the concentration fixed
+
+        assert temperature > 0., 'cannot perturb a deterministic policy'
+
+        unit_mean, conc = self.to_transformed(params, temperature = temperature)
+
+        if scale > 0.:
+            noise = torch.empty_like(unit_mean).uniform_(-1., 1., generator = generator)
+            unit_mean = self.clamp_unit_mean(unit_mean + noise * scale / self.scale)
+
+        return self.from_transformed((unit_mean, conc), apply_unimodal = apply_unimodal)
+
     def forward(
         self,
         params: Tensor,
         temperature: float = 1.,
-        detach_entropy_mean: bool | None = None
+        detach_entropy_mean: bool | None = None,
+        perturb_mean_scale: float = 0.
     ) -> Distribution:
         assert temperature >= 0., f'temperature must be non-negative, got {temperature}'
+        assert perturb_mean_scale >= 0., f'perturb_mean_scale must be non-negative, got {perturb_mean_scale}'
+
+        if perturb_mean_scale > 0.:
+            return self.perturb_mean(params, scale = perturb_mean_scale, temperature = temperature)
 
         detach_entropy_mean = default(detach_entropy_mean, self.detach_entropy_mean)
 

@@ -36,6 +36,36 @@ def test_end_to_end(pos_fn, val_range):
     dist.rsample().sum().backward()
     assert torch.isfinite(params.grad).all()
 
+# rpo - perturb the mean at update time, concentration fixed
+
+def test_perturb_mean():
+    beta = Beta(init_conc = 2., squash_fn = 'tanh')
+    params = torch.randn(8, 4, 2, requires_grad = True)
+
+    dist = beta(params)
+    perturbed = beta.perturb_mean(params, scale = 0.2, generator = torch.Generator().manual_seed(0))
+
+    low, high = beta.bounds
+    assert ((perturbed.mean >= low) & (perturbed.mean <= high)).all()
+    assert (perturbed.mean - dist.mean).abs().max() <= 0.2 + 1e-5
+
+    conc = lambda d: d.base_dist.concentration1 + d.base_dist.concentration0
+    assert torch.allclose(conc(perturbed), conc(dist), atol = 1e-5)
+
+    perturbed.log_prob(perturbed.sample()).sum().backward()
+    assert torch.isfinite(params.grad).all()
+
+    forward_perturbed = beta(params, perturb_mean_scale = 0.2)
+    assert ((forward_perturbed.mean >= low) & (forward_perturbed.mean <= high)).all()
+    assert torch.allclose(conc(forward_perturbed), conc(dist), atol = 1e-5)
+
+    assert torch.allclose(beta.perturb_mean(params, scale = 0.).mean, dist.mean, atol = 1e-6)
+    assert torch.allclose(beta(params, perturb_mean_scale = 0.).mean, dist.mean, atol = 1e-6)
+
+    unimodal = beta.perturb_mean(params, scale = 0.2, apply_unimodal = True)
+    assert (unimodal.base_dist.concentration1 >= 1.).all()
+    assert (unimodal.base_dist.concentration0 >= 1.).all()
+
 # mean is preserved exactly, regardless of concentration
 
 @param('val_range', [(-1., 1.), (0., 1.)])

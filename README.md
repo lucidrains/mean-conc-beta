@@ -90,6 +90,17 @@ beta = Beta(squash_fn = 'softsign')
 beta = Beta(squash_fn = lambda x: x / (1. + x ** 2).sqrt())
 ```
 
+## Mean perturbation
+
+For update-time mean perturbation, as in Robust Policy Optimization, the concentration is held fixed and the mean is shifted by uniform noise in action space:
+
+```python
+dist = beta(params, perturb_mean_scale = 0.5)
+log_prob = dist.log_prob(actions)
+```
+
+The explicit `beta.perturb_mean(params, scale = 0.5)` path also supports `apply_unimodal` and a `generator`.
+
 ## Citations
 
 ```bibtex
@@ -109,5 +120,14 @@ beta = Beta(squash_fn = lambda x: x / (1. + x ** 2).sqrt())
     author  = {Po-Wei Chou and Daniel Maturana and Sebastian Scherer},
     booktitle = {International Conference on Machine Learning},
     year    = {2017}
+}
+```
+
+```bibtex
+@article{rahman2022robust,
+    title   = {Robust Policy Optimization in Deep Reinforcement Learning},
+    author  = {Rahman, Md Masudur and Xue, Yexiang},
+    journal = {arXiv preprint arXiv:2212.07536},
+    year    = {2022}
 }
 ```
