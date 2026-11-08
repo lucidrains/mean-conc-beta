@@ -473,6 +473,12 @@ class Beta(Module):
     def clamp_log_conc(self) -> float | None:
         return self.clamp_exp[1] if exists(self.clamp_exp) else None
 
+    @property
+    def target_entropy(self) -> Tensor:
+        conc = max(self.init_conc + default(self.max_unimodal_floor, 0.), 2. + self.eps)
+        unit_mean = as_tensor((0.5, 1. / conc), device = self.log_scale.device, dtype = self.log_scale.dtype)
+        return to_beta(unit_mean, conc).entropy().mean() + self.log_scale
+
     # decorate env.step to auto-rescale and clip actions
 
     def rescale_env_step(

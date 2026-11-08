@@ -920,3 +920,9 @@ def test_action_transform_kwargs_reach_bound():
 
     env.step(saturated)
     assert torch.allclose(torch.from_numpy(env.last_action), tensor([1., -1.]), atol = 1e-5)
+
+def test_target_entropy():
+    beta = Beta()
+    assert beta(tensor([[100., 0.]])).entropy() < beta.target_entropy < beta(tensor([[0., 0.]])).entropy()
+    assert Beta(max_unimodal_floor = 100.).target_entropy < beta.target_entropy < Beta(max_unimodal_floor = 20.).target_entropy
+    assert Beta(bounds = [(-1., 1.), (0., 1.)]).target_entropy.shape == (2,)
