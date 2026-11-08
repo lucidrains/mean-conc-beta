@@ -361,7 +361,7 @@ class Beta(Module):
         self,
         bounds = None,
         pos_fn = 'softplus',
-        init_conc = 10.,
+        init_conc = 5.,
         min_conc = 0.,
         eps = 1e-5,
         unimodal: bool | float = True,

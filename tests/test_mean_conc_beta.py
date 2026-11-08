@@ -672,9 +672,9 @@ def test_alpha_beta_concentration_config():
 
     # init_conc and min_conc set the raw offset, clamp_exp bounds the raw concentrations
 
-    assert math.isclose(beta.concentration(tensor([0.]), indexed = True).item(), 10., rel_tol = 1e-5)
-    assert math.isclose(beta.concentration(tensor([100.]), indexed = True).item(), 9. * math.exp(2.) + 1., rel_tol = 1e-4)
-    assert math.isclose(beta.concentration(tensor([-100.]), indexed = True).item(), 9. * math.exp(-2.) + 1., rel_tol = 1e-4)
+    assert math.isclose(beta.concentration(tensor([0.]), indexed = True).item(), 5., rel_tol = 1e-5)
+    assert math.isclose(beta.concentration(tensor([100.]), indexed = True).item(), 4. * math.exp(2.) + 1., rel_tol = 1e-4)
+    assert math.isclose(beta.concentration(tensor([-100.]), indexed = True).item(), 4. * math.exp(-2.) + 1., rel_tol = 1e-4)
 
 def test_alpha_beta_matches_native_beta():
     beta = Beta(range = (0., 1.), param_with_alpha_beta = True)
@@ -722,11 +722,11 @@ def test_alpha_beta_detach_entropy_mean():
 def test_alpha_beta_mode_and_kl():
     beta = Beta(param_with_alpha_beta = True, unimodal = False, pos_fn = 'exp')
 
-    # raw params log(0.3) and log(0.6) give alpha = 3 and beta = 6 at init_conc = 10
-    # mode = (alpha - 1) / (alpha + beta - 2) = 2/7 on (-1., 1.)
+    # raw params log(0.3) and log(0.6) give alpha = 1.5 and beta = 3 at init_conc = 5
+    # mode = (alpha - 1) / (alpha + beta - 2) = 1/5 on (-1., 1.)
 
     params = tensor([[[math.log(0.3), math.log(0.6)]]])
-    expected_mode = -1. + (2. / 7.) * 2.
+    expected_mode = -1. + (1. / 5.) * 2.
 
     assert torch.allclose(beta.mode(params), tensor([[expected_mode]]), atol = 1e-4)
     assert torch.allclose(beta.kl_divergence(params, params), torch.zeros(1), atol = 1e-5)
