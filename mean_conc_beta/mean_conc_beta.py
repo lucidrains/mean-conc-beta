@@ -15,8 +15,10 @@ from torch.distributions import (
     Distribution,
     TransformedDistribution
 )
-from torch.distributions.kl import kl_divergence, register_kl
+from torch.distributions.kl import register_kl
 from torch.nn import Module
+
+from torch_einops_utils import kl_divergence
 
 # helpers
 
@@ -34,6 +36,14 @@ def straight_through(x: Tensor, y: Tensor) -> Tensor:
 
 def parse_sample_shape(sample_shape) -> Size:
     return Size((sample_shape,) if isinstance(sample_shape, int) else sample_shape)
+
+def beta_entropy(dist: Distribution) -> Tensor:
+    # H(beta) = -kl(beta || uniform)
+    if not isinstance(dist, _Beta):
+        return dist.entropy()
+
+    ones = torch.ones_like(dist.concentration1)
+    return -kl_divergence(dist, _Beta(ones, ones))
 
 def clamp_unit_interval(x: Tensor, eps: float | Tensor) -> Tensor:
     # clamp into (0, 1) at representable bounds - 1. - eps rounds back onto 1. in float32 for small eps,
@@ -229,7 +239,7 @@ class TransformedBeta(TransformedDistribution):
 
     def base_entropy(self, detach_mean: bool | None = None) -> Tensor:
         if exists(self.entropy_base_dist):
-            return self.entropy_base_dist.entropy()
+            return beta_entropy(self.entropy_base_dist)
 
         base_dist = self.base_dist
 
@@ -241,7 +251,7 @@ class TransformedBeta(TransformedDistribution):
             conc = base_dist.concentration1 + base_dist.concentration0
             base_dist = to_beta(base_dist.mean.detach(), conc)
 
-        return base_dist.entropy()
+        return beta_entropy(base_dist)
 
     def entropy(self, detach_mean: bool | None = None) -> Tensor:
         if isinstance(self.base_dist, Deterministic):
@@ -477,7 +487,7 @@ class Beta(Module):
     def target_entropy(self) -> Tensor:
         conc = max(self.init_conc + default(self.max_unimodal_floor, 0.), 2. + self.eps)
         unit_mean = as_tensor((0.5, 1. / conc), device = self.log_scale.device, dtype = self.log_scale.dtype)
-        return to_beta(unit_mean, conc).entropy().mean() + self.log_scale
+        return beta_entropy(to_beta(unit_mean, conc)).mean() + self.log_scale
 
     # decorate env.step to auto-rescale and clip actions
 
@@ -704,7 +714,7 @@ class Beta(Module):
         detach_mean: bool | None = None
     ) -> Tensor:
         dist = self.to_dist(params_or_dist, temperature = temperature)
-        entropy = dist.entropy(detach_mean = detach_mean) if isinstance(dist, TransformedBeta) else dist.entropy()
+        entropy = dist.entropy(detach_mean = detach_mean) if isinstance(dist, TransformedBeta) else beta_entropy(dist)
         return entropy.sum(dim = -1) if sum_action_dim else entropy
 
     def kl_divergence(
@@ -736,7 +746,7 @@ class Beta(Module):
 
         assert not isinstance(base_dist, Deterministic), 'kl_uniform is not defined for a deterministic distribution (temperature = 0)'
 
-        kl = -dist.base_entropy(detach_mean = detach_mean) if isinstance(dist, TransformedBeta) else -base_dist.entropy()
+        kl = -dist.base_entropy(detach_mean = detach_mean) if isinstance(dist, TransformedBeta) else -beta_entropy(base_dist)
         return kl.sum(dim = -1) if sum_action_dim else kl
 
     prior_loss = kl_uniform
