@@ -110,21 +110,35 @@ def test_squash_fn_boundary_gradient():
         assert raw_mean.grad.item() > 1e-4
 
 def test_leaky_tanh():
-    x = tensor([2.], requires_grad = True)
+    fn = LeakyTanh(leak = 0.1)
 
-    # forward is exactly tanh, backward is floored at leak
-    out = LeakyTanh(leak = 0.1)(x)
-    assert torch.allclose(out, tensor([2.]).tanh(), atol = 1e-6)
+    def grad_at(val, sign = 1.):
+        x = tensor([val], requires_grad = True)
+        (sign * fn(x)).backward()
+        return x.grad
+
+    tanh_grad = lambda val: tensor([1. - math.tanh(val) ** 2])
+
+    # exact tanh forward
+
+    assert torch.allclose(fn(tensor([2.])), tensor([2.]).tanh(), atol = 1e-6)
     assert torch.allclose(leaky_tanh(tensor([2.]), leak = 0.1), tensor([2.]).tanh(), atol = 1e-6)
 
-    out.backward()
-    assert torch.allclose(x.grad, tensor([0.9 * (1. - math.tanh(2.) ** 2) + 0.1]))
+    # saturated: floor on escape, exact grad pushing further out
+
+    assert torch.allclose(grad_at(2., 1.), tensor([0.1]))
+    assert torch.allclose(grad_at(2., -1.), -tanh_grad(2.))
+
+    # interior: exact grad in both directions
+
+    assert torch.allclose(grad_at(1., 1.), tanh_grad(1.))
+    assert torch.allclose(grad_at(1., -1.), -tanh_grad(1.))
 
     with raises(AssertionError):
         LeakyTanh(-0.1)
 
     with raises(AssertionError):
-        leaky_tanh(x, -0.1)
+        leaky_tanh(tensor([2.]), -0.1)
 
     with raises(AssertionError):
         Beta(squash_fn = 'unknown')

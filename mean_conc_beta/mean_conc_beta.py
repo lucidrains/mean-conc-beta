@@ -275,7 +275,7 @@ def _kl_transformed_beta(p: TransformedBeta, q: TransformedBeta) -> Tensor:
 
 class DirectedLeakyTanh(Function):
     @staticmethod
-    def forward(ctx, x: Tensor, leak: float = 0.1) -> Tensor:
+    def forward(ctx, x: Tensor, leak: float = 0.01) -> Tensor:
         ctx.leak = leak
         out = x.tanh()
         ctx.save_for_backward(out)
@@ -288,17 +288,17 @@ class DirectedLeakyTanh(Function):
 
         # leak is only applied when the gradient step pulls x back towards 0 (escaping saturation)
         escaping = (grad_output * out) > 0.
-        leak_grad = (1. - ctx.leak) * sech2 + ctx.leak
+        leak_grad = sech2.clamp(min = ctx.leak)
         grad = torch.where(escaping, leak_grad, sech2)
 
         return grad_output * grad, None
 
-def leaky_tanh(x: Tensor, leak: float = 0.1) -> Tensor:
+def leaky_tanh(x: Tensor, leak: float = 0.01) -> Tensor:
     assert 0. <= leak <= 1., f'leak factor must be between 0 and 1, got {leak}'
     return DirectedLeakyTanh.apply(x, leak)
 
 class LeakyTanh(Module):
-    def __init__(self, leak = 0.1):
+    def __init__(self, leak = 0.01):
         super().__init__()
         assert 0. <= leak <= 1., f'leak factor must be between 0 and 1, got {leak}'
         self.leak = leak
